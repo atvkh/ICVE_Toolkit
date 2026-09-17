@@ -3,7 +3,6 @@
 [![Python](https://img.shields.io/badge/Python-3.8%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20macOS%20%7C%20Linux-555?logo=windows&logoColor=white)](#快速开始)
 [![License](https://img.shields.io/badge/License-PolyForm--NC--1.0.0-EF9421)](./LICENSE)
-[![Release](https://img.shields.io/github/v/release/atvkh/ICVE_Toolkit?logo=github&color=2EA44F)](https://github.com/atvkh/ICVE_Toolkit/releases/latest)
 [![Stars](https://img.shields.io/github/stars/atvkh/ICVE_Toolkit?style=flat&logo=github&color=yellow)](https://github.com/atvkh/ICVE_Toolkit/stargazers)
 [![Forks](https://img.shields.io/github/forks/atvkh/ICVE_Toolkit?style=flat&logo=github&color=blue)](https://github.com/atvkh/ICVE_Toolkit/forks)
 [![Issues](https://img.shields.io/github/issues/atvkh/ICVE_Toolkit?style=flat&logo=github&color=orange)](https://github.com/atvkh/ICVE_Toolkit/issues)
@@ -143,8 +142,7 @@
 
 **前置:依赖检测**
 - 启动前先检测滑块登录依赖(`playwright` / `opencv-python` / `numpy` / `scipy` / `pillow`)
-- 缺失时询问一键自动安装(含 Chromium 浏览器内核,约 300MB,需联网),装不上直接转人工,不浪费输账密
-- 打包后的 exe 无 pip,请提前按[快速开始](#快速开始)准备好环境或直接用源码运行模式
+- 依赖缺失时询问一键自动安装(含 Chromium 浏览器内核,约 300MB,需联网),装不上直接转人工,不浪费输账密
 
 **流程(回车后约 2~4 秒)**:
 1. 选择登录新账号时,后台立即预热:隐藏的 Chromium(屏幕外窗口,不干扰使用)加载内置极简登录页并预先弹出滑块——与你在终端输账密并行,零等待;终端焦点被抢时会自动抢回,无需重新点击面板
@@ -176,11 +174,7 @@
 
 ### 安装
 
-**方式一:免安装(推荐小白)**
-
-从 [Releases](https://github.com/atvkh/ICVE_Toolkit/releases/latest) 下载 `ICVE_Toolkit.exe`,双击即可运行,无需安装 Python 环境。
-
-**方式二:源码运行**
+本项目以源码形式发布(不再提供打包 exe),克隆后安装依赖即可运行:
 
 ```bash
 git clone https://github.com/atvkh/ICVE_Toolkit.git
@@ -188,6 +182,8 @@ cd ICVE_Toolkit
 pip install -r requirements.txt
 playwright install chromium
 ```
+
+> 滑块自动登录依赖 `playwright`/`opencv-python`/`numpy`/`scipy`/`pillow`,首次运行时若检测缺失也会询问一键安装(含 Chromium 内核约 300MB,需联网)。
 
 ### 运行
 
