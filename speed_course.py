@@ -19,8 +19,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
 
 from zjy_client import (
-    ZjyClient, BASE_URL, IMAGE_TYPES, VIDEO_TYPES,
-    extract_file_url, get_mp4_duration,
+    ZjyClient, BASE_URL, IMAGE_TYPES, VIDEO_TYPES, AUDIO_TYPES,
+    extract_file_url, get_mp4_duration, get_mp3_duration,
 )
 from utils import log
 
@@ -46,8 +46,13 @@ def run_speed_course(client: ZjyClient, course: dict, speed_type: str = "all",
 
     :param client: ZjyClient 实例
     :param course: 课程 dict,需含 classId/courseInfoId/courseId/_courseType/courseName
-    :param speed_type: "all" | "progress" | "discussion"
+    :param speed_type: "all" | "progress" | "exam" | "discussion"
     :param simulate_real: True=模拟真实(逐条间隔),False=快速并发
+
+    MOOC 重叠流水线(2026-09-14 生产移植):任务开头先把全部未交卷"点开"起表
+    (205 时间闸门只认 wall-clock,起表后刷课件/讨论的耗时天然攒够答题时间)→
+    刷进度 → 成熟卷并发即交、未熟卷留补交 → 刷讨论 → 补交剩余(并行补等)。
+    SPOC/RESOURCE 不进入流水线(红线:行为与原顺序模式一致)。
     """
     class_id = course.get("classId", "")
     course_info_id = course.get("courseInfoId", "")
@@ -58,23 +63,122 @@ def run_speed_course(client: ZjyClient, course: dict, speed_type: str = "all",
 
     log(f"[{nickname}] 🚀 启动刷课: {course_name} (类型:{ctype}, 模式:{speed_type})", "INFO")
 
+    _mooc_exam_pending = None   # None=未探测;list=尚未成功提交的未交卷
+    _mooc_stats = {"success": 0, "fail": 0, "skip": 0, "window_skip": 0}
+
     try:
+        # MOOC 重叠流水线·提前起表(仅 MOOC;起表失败自动降级=答题环节重新枚举)
+        if ctype == "MOOC" and speed_type in ("all", "exam"):
+            try:
+                from answer import (get_course_exams_list, _is_low_score,
+                                    mooc_stagger_open_exams)
+                _ex0 = get_course_exams_list(client, class_id, course_info_id, course_id, ctype)
+                _mooc_exam_pending = [e for e in _ex0 if _is_low_score(e)]
+                if _mooc_exam_pending:
+                    mooc_stagger_open_exams(client, _mooc_exam_pending, nickname)
+            except Exception as e:
+                _mooc_exam_pending = None
+                log(f"[{nickname}] ⚠️ 提前起表失败(答题环节将重新枚举): {e}", "WARNING")
+
         # Part 1: 刷进度
         if speed_type in ["all", "progress"]:
             _brush_progress(client, nickname, class_id, course_info_id, course_id, ctype, simulate_real)
 
-        # Part 1.5: 自动答题(进度刷完后,刷讨论前)
+        # Part 1.5: 自动答题(MOOC 走成熟度分流+并发提交;SPOC/RESOURCE 原顺序模式)
         if speed_type in ["all", "exam"]:
-            _brush_exam(client, nickname, class_id, course_info_id, course_id, ctype)
+            if ctype == "MOOC":
+                _mooc_exam_pending = _brush_exam_mooc_stage1(
+                    client, nickname, class_id, course_info_id,
+                    course_id, _mooc_exam_pending, _mooc_stats)
+            else:
+                _brush_exam(client, nickname, class_id, course_info_id, course_id, ctype)
 
         # Part 2: 刷讨论
         if speed_type in ["all", "discussion"]:
             _brush_discussion(client, nickname, class_id, course_info_id, course_id, ctype)
 
+        # Part 2.5: MOOC 未成熟卷补交(刷讨论期间已继续垫墙钟,并发补等剩余差额)
+        if (ctype == "MOOC" and speed_type in ("all", "exam") and _mooc_exam_pending):
+            log(f"[{nickname}] 🕒 补交未到答题时间的 {len(_mooc_exam_pending)} 张试卷(不足部分并行补等)...", "INFO")
+            _mooc_submit_batch(client, nickname, class_id, course_info_id, course_id,
+                               _mooc_exam_pending, _mooc_stats)
+
+        # MOOC 答题环节汇总
+        if ctype == "MOOC" and speed_type in ("all", "exam") and _mooc_exam_pending is not None:
+            _tail = f",跳过(作答次数上限) {_mooc_stats['skip']}" if _mooc_stats["skip"] else ""
+            if _mooc_stats["window_skip"]:
+                _tail += f",跳过(作答窗口未开放) {_mooc_stats['window_skip']}"
+            log(f"[{nickname}] 🎉 自动答题结束:成功 {_mooc_stats['success']} 个,"
+                f"失败 {_mooc_stats['fail']} 个{_tail}", "INFO")
+
     except Exception as e:
         log(f"[{nickname}] 刷课异常: {e}", "ERROR")
 
     log(f"[{nickname}] 🏁 刷课结束: {course_name}", "INFO")
+
+
+def _brush_exam_mooc_stage1(client: ZjyClient, nickname: str, class_id: str,
+                            course_info_id: str, course_id: str,
+                            pending, stats: dict) -> list:
+    """MOOC 重叠流水线·第一遍提交:优先用任务头起表清单(起表失败则就地重新枚举+起表);
+    逐卷探测成熟度,已成熟批并发即交(gate_wait 秒过),未熟卷返回给调用方待 Part 2.5 补交。"""
+    from answer import (get_course_exams_list, _is_low_score, mooc_stagger_open_exams,
+                        mooc_exam_gate_remaining)
+    if pending is None:
+        exams = get_course_exams_list(client, class_id, course_info_id, course_id, "MOOC")
+        pending = [e for e in exams if _is_low_score(e)]
+        if pending:
+            mooc_stagger_open_exams(client, pending, nickname)
+    _mature, _immature = [], []
+    for exam in list(pending):
+        eid = exam.get("id") or exam.get("examId")
+        rem, _gmin = mooc_exam_gate_remaining(client, eid) if eid else (0, 0)
+        (_immature if rem > 0 else _mature).append(exam)
+    if not _mature and not _immature:
+        log(f"[{nickname}] 没有发现未提交或低分的作业或考试", "INFO")
+        return []
+    log(f"[{nickname}] 📋 答题:{len(_mature)} 张已成熟即交,{len(_immature)} 张未到时间闸门留待后续补交", "INFO")
+    if _mature:
+        _mooc_submit_batch(client, nickname, class_id, course_info_id, course_id, _mature, stats)
+    return _immature
+
+
+def _mooc_submit_batch(client: ZjyClient, nickname: str, class_id: str,
+                       course_info_id: str, course_id: str, exam_list: list,
+                       stats: dict) -> int:
+    """并发提交一批 MOOC 卷(8 workers,gate_wait=True → 已成熟秒过、未熟线程内并行补等,
+    总墙钟≈最慢单卷)。205 双语义分流:「作答次数上限」/「非作答时间」记跳过不记失败。
+    返回实际提交数。仅 MOOC 路径调用。"""
+    from answer import (do_auto_answer_single_exam, mooc_exam_is_exhausted,
+                        mooc_exam_window_closed)
+    if not exam_list:
+        return 0
+
+    def _one(exam):
+        eid = exam.get("id") or exam.get("examId")
+        title = exam.get("title", "未命名任务")
+        etype = exam.get("type", "")
+        cat = "2" if etype == "考试" else ("3" if etype == "测验" else "1")
+        return do_auto_answer_single_exam(
+            client, nickname, eid, class_id, course_info_id, course_id,
+            "MOOC", title, cat, gate_wait=True)
+
+    with ThreadPoolExecutor(max_workers=8) as _ex_pool:
+        _futs = {_ex_pool.submit(_one, e): e for e in exam_list}
+        for _f in as_completed(_futs):
+            try:
+                ok, msg = _f.result()
+            except Exception as _fe:
+                ok, msg = False, f"EXC {str(_fe)[:80]}"
+            if ok:
+                stats["success"] += 1
+            elif mooc_exam_is_exhausted(msg):
+                stats["skip"] += 1          # 次数上限:不重试不记失败
+            elif mooc_exam_window_closed(msg):
+                stats["window_skip"] += 1   # 窗口未开放:记跳过非失败
+            else:
+                stats["fail"] += 1
+    return len(exam_list)
 
 
 # ==================== Part 1: 刷进度 ====================
@@ -88,18 +192,31 @@ def _brush_progress(client: ZjyClient, nickname: str, class_id: str,
     # 先扫描未完成的课件
     leaf_cells = client.get_course_cells(course_info_id, class_id, course_id, include_completed=False, ctype=ctype)
     leaf_cells = [c for c in leaf_cells if (c.get("fileType") or "") not in ["作业", "测验", "考试", "讨论", "exam", "homework"]]
+    # SWF 课件预过滤(2026-08-31 生产移植):.swf Flash 动画平台直接拒绝心跳(500),
+    # 历史连败 3 次触发熔断把整门课拖死。过滤口径=fileUrl 含 ".swf",跳过不计失败。
+    _swf_skipped = [c for c in leaf_cells if ".swf" in (c.get("fileUrl") or "")]
+    if _swf_skipped:
+        leaf_cells = [c for c in leaf_cells if ".swf" not in (c.get("fileUrl") or "")]
+        log(f"[{nickname}] 跳过 {len(_swf_skipped)} 个 SWF 动画课件(平台不支持心跳刷时长)", "INFO")
 
     # 全部已完成则重刷(加时长)
     if not leaf_cells:
         log(f"[{nickname}] 所有课件已完成,将全部重刷以增加时长...", "INFO")
         leaf_cells = client.get_course_cells(course_info_id, class_id, course_id, include_completed=True, ctype=ctype)
         leaf_cells = [c for c in leaf_cells if (c.get("fileType") or "") not in ["作业", "测验", "考试", "讨论", "exam", "homework"]]
+        # SWF 同款预过滤(重刷分支,口径同上)
+        _swf_skipped2 = [c for c in leaf_cells if ".swf" in (c.get("fileUrl") or "")]
+        if _swf_skipped2:
+            leaf_cells = [c for c in leaf_cells if ".swf" not in (c.get("fileUrl") or "")]
+            log(f"[{nickname}] 跳过 {len(_swf_skipped2)} 个 SWF 动画课件(重刷分支)", "INFO")
         # 跳过已完成的图片课件(重刷会导致进度回退)
+        # 生产 2026-09-16 消噪:SPOC 图片课件 fileType 主值是 'img'(不在 IMAGE_TYPES 集合),
+        # 同为计数型 totalNum=1 课件,重刷同样回退——仅在本保护点补 'img',不动全局集合。
         _skipped_img = 0
         _filtered = []
         for c in leaf_cells:
             _ct = (c.get("fileType") or "").lower()
-            if _ct in IMAGE_TYPES and c.get("_speed", 0) >= 100:
+            if (_ct in IMAGE_TYPES or _ct == "img") and c.get("_speed", 0) >= 100:
                 _skipped_img += 1
                 continue
             _filtered.append(c)
@@ -124,9 +241,11 @@ def _brush_progress(client: ZjyClient, nickname: str, class_id: str,
     consecutive_fails = 0
 
     for idx, cell in enumerate(leaf_cells):
-        # 连续失败保护
-        if consecutive_fails >= 3:
-            log(f"[{nickname}] ⚠️ 连续3次刷课失败,停止尝试", "WARNING")
+        # 连续失败保护(2026-09-11 生产移植):MOOC 阈值升至 10——实测平台限流为瞬时抖动,
+        # 同节点 2 分钟后单发即成功;原阈值 3 使一次抖动直接中断整场刷课。SPOC/RESOURCE 维持 3。
+        _fail_limit = 10 if ctype == "MOOC" else 3
+        if consecutive_fails >= _fail_limit:
+            log(f"[{nickname}] ⚠️ 连续{_fail_limit}次刷课失败,停止尝试", "WARNING")
             break
 
         cell_id = cell.get("id")
@@ -155,9 +274,15 @@ def _brush_progress(client: ZjyClient, nickname: str, class_id: str,
                     f"(id={cell.get('id','?')}, fileType={cell.get('fileType','?')}, "
                     f"totalTime={total_time}, _speed={cell.get('_speed','?')})", "WARNING")
 
-        # 快速模式无间隔(原0.02s×385=7.7s纯等待),模拟真实模式保留间隔
-        if simulate_real:
+        # 节点间冷却(2026-09-11 生产移植):MOOC 快速模式原 0.02s 过密——80 节点连续
+        # ~1 万次心跳在 27 节点处触发平台限流;1.5s 冷却实测可全程不撞限流。
+        # SPOC/RESOURCE 间隔维持原值不变(红线)。
+        if ctype == "MOOC" and not simulate_real:
+            time.sleep(1.5)
+        elif simulate_real:
             time.sleep(0.1)
+        else:
+            time.sleep(0.02)
 
     log(f"[{nickname}] 🎉 进度秒刷结束:成功 {success_count} 个,失败 {fail_count} 个", "INFO")
 
@@ -185,7 +310,13 @@ def _parse_mp4_durations_parallel(client: ZjyClient, nickname: str, leaf_cells: 
         try:
             _ori_url = extract_file_url(_c.get("fileUrl"))
             if _ori_url:
-                _dur = get_mp4_duration(_ori_url)
+                # 音频课件先走 MP3 解析(生产 2026-09-16 消噪移植):MP3 无 moov box,
+                # 直进 MP4 三策略必失败;先 MP3、失败回落 MP4(m4a 实为 MP4 容器,双跳零回归)。
+                _dur = None
+                if (_c.get("fileType") or "").lower() in AUDIO_TYPES:
+                    _dur = get_mp3_duration(_ori_url)
+                if not _dur:
+                    _dur = get_mp4_duration(_ori_url)
                 return (_i, _dur if _dur and _dur > 0 else None)
         except Exception:
             pass
@@ -248,7 +379,12 @@ def _calculate_total_time(client: ZjyClient, nickname: str, cell: dict, idx: int
             try:
                 ori_url = extract_file_url(file_url_raw)
                 if ori_url:
-                    parsed = get_mp4_duration(ori_url)
+                    # 音频先 MP3 解析(同并行路径),失败回落 MP4
+                    parsed = None
+                    if cell_type in AUDIO_TYPES:
+                        parsed = get_mp3_duration(ori_url)
+                    if not parsed:
+                        parsed = get_mp4_duration(ori_url)
                     if parsed and parsed > 0:
                         mp4_time = parsed
                     else:
@@ -364,8 +500,16 @@ def _submit_mooc_heartbeat(client: ZjyClient, nickname: str, cell: dict, idx: in
     if is_image:
         heartbeat_count = min(heartbeat_count, 5)
 
-    # 探测可用 API
+    # 探测可用 API(全灭→冷却 15s+重认证 AI 域后二轮探测;仍败才计失败——生产 2026-09-11 C 移植,
+    # 实测限流为瞬时抖动,冷却后大概率恢复;原单轮即弃使一次抖动废掉整个课件)
     working_api = _probe_mooc_api(client, mooc_record, heartbeat_interval)
+    if not working_api:
+        time.sleep(15)
+        try:
+            client.auth_ai_domain()
+        except Exception:
+            pass
+        working_api = _probe_mooc_api(client, mooc_record, heartbeat_interval)
     if not working_api:
         log(f"[{nickname}] 刷进度 ❌ [{idx+1}/{total}] {cell.get('name','?')} MOOC提交全部失败(无可用API)", "WARNING")
         return False
@@ -590,21 +734,32 @@ def _submit_spoc_heartbeat(client: ZjyClient, nickname: str, cell: dict,
                                     is_image, aes_key)
     else:
         return _spoc_fast_concurrent(client, record_proto, hb_count, total_time,
-                                      is_image, aes_key)
+                                      is_image, aes_key, nickname)
 
 
 def _spoc_simulate_real(client: ZjyClient, record_proto: dict, hb_count: int,
                          total_time: int, is_image: bool, aes_key: str) -> bool:
-    """SPOC 模拟真实模式:逐条发送,间隔8-15秒。"""
+    """SPOC 模拟真实模式(2026-09-14 生产移植):服务端每条心跳固定 +5 秒、完全忽略
+    客户端 studyTime。共用的 hb_count=total_time 是给快速模式做并发限流补偿的,
+    串行沿用=5 倍超发(600 秒课件发 600 条×8-15s≈57 分钟,真实只要 10 分钟)。
+    故串行按 +5 秒机制独立计条数(达标下限 ceil(total/5) 加 20% 余量容忍偶发失败),
+    并把间隔压到 ≈5 秒,使"真实经过时间≈服务端累计时长"(≈1.2 倍速,真人看课正常形态)。
+    图片课件按计数达标,沿用共用条数。"""
+    if is_image:
+        _sim_hb_count = hb_count
+    else:
+        _sim_min = -(-total_time // 5)
+        _sim_hb_count = min(_sim_min + max(2, _sim_min // 5), 2000)
     ok_count = 0
-    for hb_idx in range(hb_count):
+    for hb_idx in range(_sim_hb_count):
         hb = dict(record_proto)
         hb["id"] = str(uuid.uuid4()).upper()
         _progress_num = 1 if is_image else total_time
-        if hb_idx == hb_count - 1:
+        if hb_idx == _sim_hb_count - 1:
             hb["studyTime"] = total_time
         else:
-            hb["studyTime"] = (hb_idx + 1) * 10
+            # 单调递增且不得超过 total_time(末条补齐;旧实现中途冲到 10×total_time 反成异常曲线)
+            hb["studyTime"] = min(total_time, (hb_idx + 1) * 5)
         hb["actualNum"] = _progress_num
         hb["lastNum"] = _progress_num
 
@@ -623,14 +778,18 @@ def _spoc_simulate_real(client: ZjyClient, record_proto: dict, hb_count: int,
                 break
         except Exception:
             break
-        if hb_idx < hb_count - 1:
-            time.sleep(random.uniform(8, 15))
+        if hb_idx < _sim_hb_count - 1:
+            time.sleep(random.uniform(4.5, 6.5))
     return ok_count > 0
 
 
 def _spoc_fast_concurrent(client: ZjyClient, record_proto: dict, hb_count: int,
-                           total_time: int, is_image: bool, aes_key: str) -> bool:
-    """SPOC 快速模式:高并发批量提交(服务器每次+5秒)。"""
+                           total_time: int, is_image: bool, aes_key: str,
+                           nickname: str = "") -> bool:
+    """SPOC 快速模式:高并发批量提交(服务器每次+5秒)。
+
+    nickname 用于失败诊断日志(修复 NameError:原实现引用未定义 nickname,
+    心跳全灭走诊断分支时必崩)。"""
     _progress_num = 1 if is_image else total_time
     payloads = []
     for _ in range(hb_count):
@@ -843,7 +1002,9 @@ def _brush_mooc_discussion(client: ZjyClient, nickname: str,
                 if str(rec.get("userId", "")) == str(client.stu_id):
                     already_replied = True
                 else:
-                    c_text = rec.get("content", "").replace("<p>", "").replace("</p>", "").strip()
+                    # content 键存在但值为 null 时 .get 默认值不生效→None.replace 必崩
+                    # (生产 M-10 修复移植)
+                    c_text = (rec.get("content") or "").replace("<p>", "").replace("</p>", "").strip()
                     if c_text and len(c_text) > 5:
                         classmate_contents.append(c_text)
 
