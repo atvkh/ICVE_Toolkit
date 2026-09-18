@@ -192,8 +192,8 @@ class ZjyClient:
                 if not self.stu_id:
                     self.stu_id = str(self.user_info.get("userId", ""))
 
-                # 自动尝试 AI 域认证
-                self.auth_ai_domain()
+                # AI 域鉴权延迟到首次访问 AI 接口时(api_*_ai 内自动补鉴权):
+                # 登录链路少一个串行 RTT,而只有 MOOC 讨论/考试才用得到 AI 域
                 return True
             else:
                 log(f"apply_token 失败: HTTP {resp.status_code}", "WARNING")
@@ -363,12 +363,19 @@ class ZjyClient:
 
     # ==================== AI 域 API(401 自动重新鉴权) ====================
 
+    def _ai_headers(self) -> dict:
+        """AI 域请求头;token 缺失(登录后未鉴权)时先补一次 AI 域鉴权。
+
+        apply_token 不再主动鉴权 AI 域,故冷会话的第一次 AI 调用在这里补齐。
+        """
+        if not self.ai_token:
+            self.auth_ai_domain()
+        return {"Authorization": f"Bearer {self.ai_token}"} if self.ai_token else {}
+
     def api_get_ai(self, path: str, params: Optional[dict] = None, timeout: int = 10) -> Optional[dict]:
         """AI 域 GET,401 时自动重新鉴权重试一次。"""
         try:
-            headers = {}
-            if self.ai_token:
-                headers["Authorization"] = f"Bearer {self.ai_token}"
+            headers = self._ai_headers()
             resp = self.session.get(f"{AI_BASE_URL}/{path}", params=params, headers=headers, timeout=timeout)
             if resp.status_code == 401:
                 self.auth_ai_domain()
@@ -384,9 +391,7 @@ class ZjyClient:
     def api_post_ai(self, path: str, body: Optional[dict] = None, timeout: int = 10) -> Optional[dict]:
         """AI 域 POST,401 时自动重新鉴权重试一次。"""
         try:
-            headers = {}
-            if self.ai_token:
-                headers["Authorization"] = f"Bearer {self.ai_token}"
+            headers = self._ai_headers()
             resp = self.session.post(f"{AI_BASE_URL}/{path}", json=body, headers=headers, timeout=timeout)
             if resp.status_code == 401:
                 self.auth_ai_domain()
@@ -402,10 +407,13 @@ class ZjyClient:
     def api_put_ai(self, path: str, body: Optional[dict] = None, timeout: int = 10) -> Optional[dict]:
         """AI 域 PUT。"""
         try:
-            headers = {}
-            if self.ai_token:
-                headers["Authorization"] = f"Bearer {self.ai_token}"
+            headers = self._ai_headers()
             resp = self.session.put(f"{AI_BASE_URL}/{path}", json=body, headers=headers, timeout=timeout)
+            if resp.status_code == 401:
+                self.auth_ai_domain()
+                if self.ai_token:
+                    headers["Authorization"] = f"Bearer {self.ai_token}"
+                resp = self.session.put(f"{AI_BASE_URL}/{path}", json=body, headers=headers, timeout=timeout)
             if resp.status_code == 200:
                 return resp.json()
         except Exception as e:

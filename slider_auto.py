@@ -1,23 +1,31 @@
 """全自动滑块登录模块:账密 → 阿里云滑块 → sso_token(零人工)。
 
-架构(实测:回车→登录响应中位 ~2s,滑块通过率配合重试 >90%):
+架构(实测:预热 ~0.3s,回车→判定 ~1.0s):
   1. 预热(与 CLI 输账密并行):同源加载自建极简登录页(robots.txt + set_content,
-     无协议框/无登录tab/无推广弹窗),自动弹滑块、预加载拼图图
-  2. 提交账密:JS 注入到自建页输入框(自建页无表单行为评分,瞬时完成)→ 鼠标热身
+     无协议框/无登录tab/无推广弹窗);拼图图到齐即真鼠标点登录键弹滑块,并在此期
+     完成鼠标热身
+  2. 提交账密:JS 注入到自建页输入框(自建页无表单行为评分,瞬时完成)
   3. 拖拽:白帽+Canny 双证据识别缺口 → 二次映射(left = 0.00355·d² + 0.0765·d,系数在线自校准)
-     反解拖距 → 真人形态轨迹(~50-70Hz)→ 闭环读 #aliyunCaptcha-puzzle 收敛 <0.7px
+     反解拖距 → 真人形态轨迹 → 闭环读 #aliyunCaptcha-puzzle 收敛 <0.7px(上限 CORR_MAX 轮)
   4. verify 回调拿 captchaVerifyParam(cvp)后,页面立即 fetch userLogin(单次使用,
      非重放)→ 拦截响应取 data.token(sso_token)
   5. 兜底:自建页流程失败(页面改版/场景漂移)→ 走真实 SSO 登录页全流程一次 →
      上层再失败转 9527 人工回调
 
 实证铁律(踩坑换来的,勿改):
-  - 行为链 > 轨迹形态:拖拽必须真鼠标 page.mouse.move,鼠标热身不能省
-    (缺失会显著推高 F001 行为风控拦截)
-  - 拖拽轨迹形态/闭环参数为实证校准值:拖太快会被风控拒(F001),勿再压缩
-  - captchaVerifyParam 一次性不可重放:回调内立即使用,禁止存储复用
-  - 同 IP 高频尝试会触发风控惩罚(响应延迟 5s+),失败后须退避等待
-  - 映射自校准:在线重拟合仅接受通过质量/合理性校验的拟合,异常时死守经验初值
+  - 行为链 > 轨迹形态:拖拽必须真鼠标 page.mouse.move,mousemove 历史不能省
+    (缺失会显著推高 F001 行为风控拦截)。热身可搬到预热期,但 mouse.down 前
+    仍须有 approach 的几次 move 作为紧邻历史。
+  - 弹窗必须由**真鼠标**点击登录键开启:页面内 JS 合成 click 无效(实测无 -verify
+    请求、弹窗不渲染),所以"等拼图到齐→立刻真点"才是开启路径,不是兜底。
+  - 闭环校正不能省:2026-09-18 实测去掉后 F015 由 18% 升到 40%(它兜的是二次映射
+    残差);但校正救不了识别偏差,故设轮数上限,别拿它精修一个算错的靶心。
+  - 拖拽总时长不是 F001 的主导因素:实测 0.22s~0.95s 全档 15 样本零 F001。
+  - captchaVerifyParam 一次性不可重放:回调内立即使用,禁止存储复用。
+  - 同 IP 高频尝试会触发风控惩罚(响应延迟 5s+),失败后须退避等待。
+  - 主线程内等待事件(hook/响应)必须走 Playwright 调用推进事件循环:纯 time.sleep
+    会饿死 response 分发,表现为"永远等不到判定"(实测假象 e2e=21s)。
+  - 映射自校准:在线重拟合仅接受通过质量/合理性校验的拟合,异常时死守经验初值。
 """
 
 import importlib
@@ -132,6 +140,15 @@ PUZZLE_SCALE = 300.0 / 296.0       # 拼图显示尺寸(300) / 原图尺寸(296)
 # 用真实(拖距,拼图位移)样本在线重拟合刷新,仅采纳通过质量校验的拟合结果
 MAP_A, MAP_B = 0.00355, 0.0765
 
+# 拖拽节奏(2026-09-18 自建页实测标定)。拖拽墙钟 ≈ pre_roll + dur + pause,
+# dur 只改"距离沿时间怎么摊",不改帧数;真正决定耗时的是帧间隔与前置/中段停顿。
+DRAG_DUR_S = (0.28, 0.38)       # 标称时长(秒);实测 0.22s 起零 F001
+DRAG_STEP_MS = (13.0, 18.0)     # 帧间隔;单次 move 派发往返 ~6ms,再压会被派发耗时兜住
+DRAG_PRE_MS = (20.0, 45.0)      # 起手前置(按下后到第一帧的距离曲线起点)
+DRAG_PAUSE_S = (0.05, 0.10)     # 中段犹豫时长
+CORR_MAX = 4                    # 闭环校正轮数上限:超过即认定靶心算错,再精修只是白等
+DRAG_WATCHDOG_S = 2.0           # 拖拽墙钟硬超时(相对标称):单次 move 被页面卡顿拖住时快速弃轮
+
 VIEWPORT = {'width': 1280, 'height': 850}
 USER_AGENT = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
               '(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36')
@@ -154,8 +171,9 @@ _STEALTH_JS = """
 """
 
 # ==================== 自建极简登录页(主路径) ====================
-# 同源加载:滑块几何与真实页一致(拼图图 300×296),二次映射/闭环常数直接复用;
-# 页面 init 后 300ms 自动点登录按钮弹出滑块(预热期完成,与输账密并行)。
+# 同源加载:滑块几何与真实页一致(拼图图 300×296),二次映射/闭环常数直接复用。
+# 弹窗不在页面内自动开(JS 合成 click 打不开 Aliyun 弹窗),由 _setup_mypage 在拼图
+# 图到齐后用真鼠标点开——整段都在预热期完成,与用户输账密并行。
 
 _LOGIN_PAGE_HTML = """<!DOCTYPE html>
 <html><head><meta charset="utf-8">
@@ -208,7 +226,7 @@ _LOGIN_PAGE_HTML = """<!DOCTYPE html>
       captchaVerifyCallback: myVerify,
       onBizValidateCallback: function() {},
     });
-    setTimeout(() => document.getElementById('captcha-button').click(), 300);
+    // 合成 .click() 打不开 Aliyun 弹窗(需真实用户激活),弹窗由 Python 侧真鼠标开启
   </script>
 </body></html>""".replace('%ORIGIN%', SSO_ORIGIN).replace('%SCENE%', CAPTCHA_SCENE_ID) \
     .replace('%PREFIX%', CAPTCHA_PREFIX)
@@ -295,8 +313,11 @@ def identify_gap(back_bytes: bytes, shadow_bytes: bytes):
 # 持久化到 slider_calib.json(运行时数据,勿提交);任一质量闸不过则保持经验初值。
 # 目的:阿里云调整拖距→位移曲线时自愈,无需重新手工标定。
 
-_CALIB_MIN_SAMPLES = 5      # 起拟合的最小样本数
+_CALIB_MIN_SAMPLES = 4      # 起拟合的最小样本数(原 5:真实登录频率低时长期攒不满,映射一直裸奔)
 _CALIB_MAX_SAMPLES = 24     # 滑动窗口:只保留最近样本(跟踪最新曲线)
+_CALIB_MIN_SPREAD = 15.0    # 拖距分布标准差下限,低于此则二次项不可辨识(原 20)
+_CALIB_MAX_RESID = 3.0      # 拟合后平均偏差上限(px)
+_CALIB_MIN_GAIN = 2.0       # 相对现用系数至少要改善这么多(px),否则视为拟合噪声
 _calib_samples = []         # [(d, left), ...]
 _calib_loaded = False
 CAL_A, CAL_B = MAP_A, MAP_B
@@ -344,23 +365,32 @@ def _calib_save():
 
 
 def _calib_refit():
-    """最小二乘重拟合;样本不足/拖距过集中/拟合偏差大/违反合理性 → 保持当前值。"""
+    """最小二乘重拟合;样本不足/拖距过集中/未显著优于现值/违反合理性 → 保持当前值。
+
+    实测教训(2026-09-18):d∈[195,255] 这类窄区间上 d² 与 d 高度共线(设计矩阵条件数
+    ~3e3),a、b 可互相补偿,拟合会把噪声当真信号——系数 b 曾因此漂 +45% 而平均偏差只
+    改善 0.09px。所以"比现状好"必须是显著好,不只是数值上略低。
+    """
     global CAL_A, CAL_B
     if len(_calib_samples) < _CALIB_MIN_SAMPLES:
         return
     try:
         ds = np.array([s[0] for s in _calib_samples], dtype=np.float64)
         ls = np.array([s[1] for s in _calib_samples], dtype=np.float64)
-        if ds.std() < 20.0:                      # 拖距分布过集中,二次拟合病态
+        if ds.std() < _CALIB_MIN_SPREAD:            # 拖距分布过集中,二次拟合病态
             return
         coef, *_ = np.linalg.lstsq(np.column_stack([ds ** 2, ds]), ls, rcond=None)
         a, b = float(coef[0]), float(coef[1])
         resid = np.abs((a * ds ** 2 + b * ds) - ls)
-        if resid.mean() > 3.0 or not _sane_curve(a, b):   # 平均偏差 >3px 或违反合理性
+        cur = np.abs((CAL_A * ds ** 2 + CAL_B * ds) - ls)   # 现值在同一批样本上的表现
+        if (resid.mean() > _CALIB_MAX_RESID                      # 绝对精度不过关
+                or resid.mean() > 0.7 * cur.mean()               # 相对现值无实质改善
+                or cur.mean() - resid.mean() < _CALIB_MIN_GAIN   # 改善量淹没在噪声里
+                or not _sane_curve(a, b)):                       # 违反合理性
             return
         if abs(a - CAL_A) > 1e-6 or abs(b - CAL_B) > 1e-6:
             log(f'  [自动登录] 映射自校准更新: A={a:.5f} B={b:.4f}'
-                f'(n={len(ds)}, 平均偏差 {resid.mean():.2f}px)', 'DEBUG')
+                f'(n={len(ds)}, 平均偏差 {resid.mean():.2f}px, 原 {cur.mean():.2f}px)', 'DEBUG')
         CAL_A, CAL_B = a, b
     except Exception:
         pass
@@ -383,27 +413,34 @@ def _invert_map(left: float) -> float:
     return (-CAL_B + (CAL_B ** 2 + 4 * CAL_A * left) ** 0.5) / (2 * CAL_A)
 
 
-# ==================== 真人形态轨迹(形态照抄 bench15,采样 ~50-70Hz) ====================
+# ==================== 真人形态轨迹(形态照抄 bench15;节奏见 DRAG_* 常量) ====================
 
-def gen_track(distance: float, seed=None, dur=None):
+def gen_track(distance: float, seed=None, dur=None, step_ms=None,
+              pre_ms=None, pause_s=None):
     """PCHIP 早峰长尾轨迹:前 25% 时间走 50% 距离,微调期一处停顿,
     末端过冲/欠冲回拉,y 随机游走 clamp ±6px。
 
-    采样 dt 14-20ms ≈ 50-70Hz:浏览器 rAF 对 mousemove 的天然节流频率,
-    也是实测 PASS 时的有效事件间隔;过密只会拖长墙钟时间,不改善形态。
+    墙钟 = pre_ms 起手 + dur + pause,帧间隔由 step_ms 决定(dur 只改距离分布,
+    不改帧数),所以想压缩耗时得同时调 step_ms/pre_ms/pause_s。
 
     :param distance: 按钮拖动总距离(px)
-    :param dur: 总时长(秒),None 则随机 0.85-1.25
+    :param dur: 主体时长(秒),None 则取 DRAG_DUR_S 区间随机
+    :param step_ms: 帧间隔区间(ms),None 取 DRAG_STEP_MS
+    :param pre_ms: 起手前置区间(ms),None 取 DRAG_PRE_MS
+    :param pause_s: 中段犹豫时长区间(秒),None 取 DRAG_PAUSE_S
     :return: [(t_ms, x, y), ...]
     """
     from scipy.interpolate import PchipInterpolator
+    step_lo, step_hi = step_ms or DRAG_STEP_MS
+    pre_lo, pre_hi = pre_ms or DRAG_PRE_MS
+    pause_lo, pause_hi = pause_s or DRAG_PAUSE_S
     rng = random.Random(seed)
     pts = []
     t = 0.0
     for _ in range(rng.randint(1, 2)):
         pts.append((t, rng.uniform(-0.3, 0.4), rng.uniform(-0.4, 0.4)))
-        t += rng.uniform(35, 70)
-    T = dur if dur else rng.uniform(0.85, 1.25)
+        t += rng.uniform(pre_lo, pre_hi)
+    T = dur if dur else rng.uniform(*DRAG_DUR_S)
     over = rng.uniform(0.005, 0.02) * rng.choice([1, -1])
     at = [0.0, rng.uniform(0.18, 0.26), rng.uniform(0.45, 0.58), rng.uniform(0.76, 0.88), 1.0]
     ax = [0.0, rng.uniform(0.48, 0.58), rng.uniform(0.89, 0.94), 1.0 + over, 1.0]
@@ -413,12 +450,12 @@ def gen_track(distance: float, seed=None, dur=None):
     while tt < T:
         xx = distance * float(pch(min(tt / T, 1.0))) + rng.uniform(-0.25, 0.25)
         pts.append((t + tt * 1000, xx, 0.0))
-        step = rng.uniform(14.0, 20.0) / 1000.0
+        step = rng.uniform(step_lo, step_hi) / 1000.0
         if rng.random() < 0.07:
             step += rng.uniform(0.010, 0.020)
         tt += step
         if not pause_done and tt / T >= pause_at:
-            ps, n = rng.uniform(0.07, 0.16), 0.0
+            ps, n = rng.uniform(pause_lo, pause_hi), 0.0
             while n < ps:
                 pts.append((t + tt * 1000, distance * float(pch(min(tt / T, 1.0))) + rng.uniform(-0.2, 0.2), 0.0))
                 tt += rng.uniform(0.012, 0.02)
@@ -435,28 +472,110 @@ def gen_track(distance: float, seed=None, dur=None):
 
 # ==================== 页面基础设施 ====================
 
-def _restore_console_focus():
+def _top_level_chrome_windows() -> dict:
+    """枚举顶层 Chrome 窗口 → {hwnd: (pid, title)}。仅 win32;失败返回空。"""
+    import ctypes
+    user32 = ctypes.windll.user32
+    found = {}
+    CBTYPE = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+
+    def cb(h, _):
+        cls = ctypes.create_unicode_buffer(256)
+        user32.GetClassNameW(h, cls, 256)
+        if cls.value == 'Chrome_WidgetWin_1':
+            tt = ctypes.create_unicode_buffer(256)
+            user32.GetWindowTextW(h, tt, 256)
+            pid = ctypes.c_ulong()
+            user32.GetWindowThreadProcessId(h, ctypes.byref(pid))
+            found[h] = (pid.value, tt.value or '')
+        return True
+
+    try:
+        user32.EnumWindows(CBTYPE(cb), 0)
+    except Exception:
+        return {}
+    return found
+
+
+def _silence_taskbar(pre_existing: set) -> int:
+    """把本次新建的浏览器窗口从任务栏/Alt-Tab 摘掉(改判 WS_EX_TOOLWINDOW)。
+
+    窗口本身保持离屏正常渲染——不用 SW_HIDE:被隐藏的窗口会被合成器降频,滑块动画与
+    布局可能停摆,而过滑块依赖真实渲染。扩展样式只在 Win32 层,页面 JS 读不到,
+    因此不影响风控指纹。只处理"这次新建且标题属于测试浏览器"的窗口,绝不动用户
+    自己开着的 Chrome。
+
+    :return: 实际改掉的窗口数
+    """
+    if sys.platform != 'win32':
+        return 0
+    try:
+        import ctypes
+        user32 = ctypes.windll.user32
+        GWL_EXSTYLE = -20
+        WS_EX_TOOLWINDOW, WS_EX_APPWINDOW = 0x00000080, 0x00040000
+        SWP_NOSIZE, SWP_NOMOVE, SWP_NOZORDER, SWP_NOACTIVATE, SWP_FRAMECHANGED = \
+            0x1, 0x2, 0x4, 0x10, 0x20
+        n = 0
+        for h, (_, title) in _top_level_chrome_windows().items():
+            if h in pre_existing:
+                continue
+            if 'Chrome' not in title:
+                continue
+            st = user32.GetWindowLongW(h, GWL_EXSTYLE) or 0
+            if st & WS_EX_TOOLWINDOW:
+                continue
+            user32.SetWindowLongW(h, GWL_EXSTYLE,
+                                  (st & ~WS_EX_APPWINDOW) | WS_EX_TOOLWINDOW)
+            # 任务栏归属变化要让 shell 重读一次框架
+            user32.SetWindowPos(h, 0, 0, 0, 0, 0,
+                                SWP_NOSIZE | SWP_NOMOVE | SWP_NOZORDER
+                                | SWP_NOACTIVATE | SWP_FRAMECHANGED)
+            n += 1
+        return n
+    except Exception:
+        return 0
+
+
+def _restore_console_focus(retry_s: float = 0.0):
     """把前台焦点抢回控制台(仅 Windows,失败静默)。
 
-    有头 Chromium 即使窗口离屏,创建时也会被系统激活,导致用户正在输账密的
-    终端失焦(敲键落到隐藏窗口里)。用"前台锁超时临时清零"技巧绕过 Windows
-    前台保护,启动完成后立即恢复,并还原原超时值。
+    实测抢焦点的不是 chromium 启动,而是 ctx.new_page() 创建首个窗口的那一刻;
+    所以调用点必须在建页之后。系统激活还可能比我们的调用晚零点几秒 → 允许在 retry_s
+    内轮询重试;重试只在"抢了我们焦点的那个窗口仍占前台"时进行,一旦前台易主
+    (说明用户自己切走了)立刻停手,不去跟他抢。SetForegroundWindow 返回值不可信,
+    一律以 GetForegroundWindow 为准。用"前台锁超时临时清零"绕过 Windows 前台保护。
     """
     if sys.platform != 'win32':
         return
     try:
         import ctypes
         kernel32, user32 = ctypes.windll.kernel32, ctypes.windll.user32
-        hwnd = kernel32.GetConsoleWindow()
-        if not hwnd:
+        con = kernel32.GetConsoleWindow()
+        if not con:
             return
+        # GetConsoleWindow 给的是 conhost 的伪控制台句柄(PseudoConsoleWindow),真正持前台的
+        # 是宿主终端窗口(经典 conhost 窗口 / Windows Terminal 的 CASCADIA_HOSTING_WINDOW_CLASS)。
+        # 判据必须用这个可见窗口,否则在 Windows Terminal 下永远判不中、白等满重试还误判失败。
+        hwnd = user32.GetAncestor(con, 3) or con     # GA_ROOTOWNER
         GET_LOCK, SET_LOCK = 0x2000, 0x2001   # SPI_GET/SETFOREGROUNDLOCKTIMEOUT
         old = ctypes.c_uint()
         user32.SystemParametersInfoW(GET_LOCK, 0, ctypes.byref(old), 0)
         zero = ctypes.c_uint(0)
         user32.SystemParametersInfoW(SET_LOCK, 0, ctypes.byref(zero), 0)
-        user32.SetForegroundWindow(hwnd)
-        user32.SystemParametersInfoW(SET_LOCK, 0, ctypes.byref(old), 0)
+        try:
+            thief = user32.GetForegroundWindow()
+            deadline = time.time() + max(0.0, retry_s)
+            while True:
+                fg = user32.GetForegroundWindow()
+                if fg == hwnd or fg == con or (thief and fg != thief):
+                    break                      # 已抢回,或前台已被第三方合法接管
+                user32.SetForegroundWindow(hwnd)
+                if time.time() >= deadline:
+                    break
+                time.sleep(0.05)
+        finally:
+            user32.SystemParametersInfoW(SET_LOCK, 0, ctypes.byref(old), 0)
     except Exception:
         pass
 
@@ -493,15 +612,43 @@ def _install_hooks(page, captured: dict, results: dict):
     page.on('response', hook_resp)
 
 
-def _setup_mypage(page, captured: dict, abort=None) -> bool:
-    """加载自建极简登录页并等滑块就绪(弹窗自动打开、图片预加载)。
+def _warmup_mouse(page, points=((320, 400), (660, 300), (950, 215))):
+    """鼠标热身:给风控攒 mousemove 历史(缺失会显著推高 F001)。
+
+    在预热期执行,与用户输账密并行,不占回车后的关键路径;拖拽前 approach 的几次
+    move 仍提供紧邻历史。
+    """
+    for wx, wy in points:
+        page.mouse.move(wx + random.uniform(-30, 30), wy + random.uniform(-20, 20),
+                        steps=random.randint(5, 9))
+        time.sleep(random.uniform(0.03, 0.07))
+
+
+def _click_open_popup(page) -> bool:
+    """真鼠标点击登录键开启弹窗(页面内 JS 合成 click 开不了,实测无 verify 请求)。"""
+    try:
+        r = page.evaluate(_JS_FIND, '#captcha-button')
+        if r:
+            page.mouse.click(r['x'], r['y'])
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _setup_mypage(page, captured: dict, abort=None, warmup: bool = True) -> bool:
+    """加载自建极简登录页 → 真点开弹窗 → 等滑块渲染 → 鼠标热身。
+
+    就绪信号不可颠倒:拼图 back/shadow 到齐说明 AliyunCaptcha 实例已建好并绑上
+    按钮监听(此时真点才有用);但弹窗未开时这些图也已预加载,故"图到齐"只是
+    "可以点"的信号,弹窗到底开没开要看滑块按钮有无尺寸。
 
     预热期调用时与用户输账密并行;重试轮调用会顺带重置滑块会话。
 
     :param abort: 可选 callables,返回 True 时提前放弃(如账密已提交,避免阻塞)
+    :param warmup: 是否在本函数内完成鼠标热身(默认搬到预热期,省关键路径 ~0.3s)
     :return: True 就绪 / False 超时或放弃
     """
-    ts = time.time()
     captured.pop('back', None)
     captured.pop('shadow', None)
     try:
@@ -514,45 +661,53 @@ def _setup_mypage(page, captured: dict, abort=None) -> bool:
     def _give_up():
         return abort is not None and abort()
 
-    # 等弹窗自动打开 + 图片字节到齐
+    # 1) 等 SDK 就绪(拼图字节到齐)→ 立刻真点开弹窗
+    #    轮询里的 page.evaluate('1') 是必须的:它推进 Playwright 事件分发,hook 才收得到图
     imgs = False
-    for _ in range(100):
+    for _ in range(120):
         if 'back' in captured and 'shadow' in captured:
             imgs = True
             break
         if _give_up():
             return False
-        page.wait_for_timeout(100)
-    # 等滑块按钮渲染完成(首屏冷加载时组件可能异步重初始化,弹窗需补点一次)
-    slider = False
-    recalled = False
-    for _ in range(150):
-        bb = None
+        page.evaluate('1')
+        time.sleep(0.02)
+    if not imgs:
+        log('  [自动登录] 预热未就绪(拼图图未到,SDK 可能改版)', 'WARNING')
+        return False
+    _click_open_popup(page)
+
+    # 2) 等弹窗内滑块渲染出尺寸;组件异步重初始化会让首点落空,按节奏补点
+    slider, clicks = False, 1
+    t0 = time.time()
+    while time.time() - t0 < 12:
         try:
-            bb = page.locator('#aliyunCaptcha-sliding-slider').bounding_box()
+            if page.locator('#aliyunCaptcha-sliding-slider').bounding_box():
+                slider = True
+                break
         except Exception:
             pass
-        if bb:
-            slider = True
-            break
-        if not recalled and time.time() - ts > 3:
-            try:   # 自动点击可能抢跑组件初始化,补点一次登录按钮
-                r = page.evaluate(_JS_FIND, '#captcha-button')
-                if r:
-                    page.mouse.click(r['x'], r['y'])
-            except Exception:
-                pass
-            recalled = True
         if _give_up():
             return False
-        page.wait_for_timeout(100)
-    if not (imgs and slider):   # 真超时才告警;因账密提交而提前放弃属正常,不吭声
-        log(f'  [自动登录] 预热未就绪(图片={imgs} 滑块={slider})', 'WARNING')
-    return imgs and slider
+        if clicks < 4 and time.time() - t0 > clicks * 1.2:
+            _click_open_popup(page)
+            clicks += 1
+        time.sleep(0.04)
+    if not slider:
+        log(f'  [自动登录] 预热未就绪(弹窗未渲染,已点 {clicks} 次)', 'WARNING')
+        return False
+    if warmup:
+        _warmup_mouse(page)
+    return True
 
 
 def _solve_slider(page, captured: dict):
-    """识别缺口 → 反解拖距 → 真人轨迹拖拽 → 闭环校正 → mouse.up(参数照抄 bench15)。"""
+    """识别缺口 → 反解拖距 → 真人轨迹拖拽 → 闭环校正 → mouse.up。
+
+    小粒度等待一律 time.sleep:page.wait_for_timeout 被浏览器 rAF 量化到 16ms 一档
+    (请求 0ms 也花 15.6ms),而本机 time.sleep 精度 1ms→1.07ms。
+    注意:等 hook/响应的那类循环不能这么写,那边必须留 Playwright 调用推进事件分发。
+    """
     gap_x1, shape_x0, conf = identify_gap(captured['back'], captured['shadow'])
     left_target = (gap_x1 - shape_x0) * PUZZLE_SCALE
     d_est = _invert_map(left_target)
@@ -566,32 +721,40 @@ def _solve_slider(page, captured: dict):
     get_left = lambda: page.evaluate(
         "() => parseFloat(document.querySelector('#aliyunCaptcha-puzzle').style.left) || 0")
 
-    dur = random.uniform(0.72, 0.95)   # 拖太快会被风控拒(F001),勿压
+    dur = random.uniform(*DRAG_DUR_S)
     pts = gen_track(d_est, seed=random.randrange(2**32), dur=dur)
     ox, oy = random.uniform(-9, 7), random.uniform(-4, 4)
     page.mouse.move(sx + ox - random.uniform(20, 50), sy + oy + random.uniform(-12, 12))
     for _ in range(2):
         page.mouse.move(sx + ox + random.uniform(-3, 3), sy + oy + random.uniform(-2, 2))
-        page.wait_for_timeout(random.uniform(4, 9))
+        time.sleep(random.uniform(0.004, 0.009))
     page.mouse.down()
-    page.wait_for_timeout(random.uniform(40, 75))
+    time.sleep(random.uniform(0.025, 0.050))     # 按下到起步的犹豫(实测 40-75ms 无必要)
     t_drag0 = time.time()
     for tt, xx, yy in pts:
         page.mouse.move(sx + ox + xx, sy + oy + yy)
-        delay = tt/1000.0 - (time.time() - t_drag0)
+        el = time.time() - t_drag0
+        delay = tt/1000.0 - el
         if delay > 0:
             time.sleep(min(delay, 0.04))
-    # 闭环兜底:实时读拼图 left,误差收敛 <0.7px 才 mouse.up
+        elif el > tt/1000.0 + DRAG_WATCHDOG_S:   # 单次 move 被页面卡顿拖住:弃本轮,别耗着
+            raise RuntimeError(f'拖拽超时(落后 {el - tt/1000.0:.1f}s)')
+    # 闭环兜底:实时读拼图 left,误差收敛 <0.7px 才松手。它兜的是二次映射残差;
+    # 轮数打满仍未收敛,基本说明缺口靶心算错了,继续精修只是把落点更准地送错地方。
     cur_x = sx + ox + d_est
-    for _ in range(9):
+    rounds = 0
+    for _ in range(CORR_MAX):
         err = left_target - get_left()
         if abs(err) < 0.7:
             break
+        rounds += 1
         step = max(min(err * 0.85, 16), -16)
         cur_x += step
         page.mouse.move(cur_x, sy + oy + random.uniform(-0.4, 0.4))
         time.sleep(random.uniform(0.010, 0.024))
-    page.wait_for_timeout(random.uniform(25, 60))
+    if rounds >= CORR_MAX:
+        log(f'  [自动登录] 校正 {rounds} 轮未收敛,疑识别偏差(conf={conf:.2f})', 'DEBUG')
+    time.sleep(random.uniform(0.018, 0.035))
     try:   # 自校准采样:(实际拖距, 实际拼图位移),拖拽已落定、松手前读取最稳定
         calib_observe(cur_x - (sx + ox), get_left())
     except Exception:
@@ -618,8 +781,11 @@ def _extract_sso_token(login_json) -> Optional[str]:
 
 # ==================== 主路径:自建极简登录页 ====================
 
-def _one_attempt_mypage(page, user: str, pwd: str, captured: dict, results: dict):
-    """主路径单次尝试:JS 注入账密 → 鼠标热身 → 拖拽 → 页面自动登录拦响应。
+def _one_attempt_mypage(page, user: str, pwd: str, captured: dict, results: dict,
+                        warmed: bool = True):
+    """主路径单次尝试:JS 注入账密 → 拖拽 → 页面自动登录拦响应。
+
+    鼠标热身默认已在 _setup_mypage(预热期)完成;只有从未经过预热时才在此补做。
 
     :return: (sso_token, stop_reason)。token 非 None 即成功;
              stop_reason 非 None 表示不值得重试(如账密被拒)。
@@ -634,29 +800,29 @@ def _one_attempt_mypage(page, user: str, pwd: str, captured: dict, results: dict
         }""", [user, pwd])
         if not fields:
             raise RuntimeError('自建页输入框缺失(页面可能已改版)')
-        # 鼠标热身:风控看 mousemove 历史(缺失会显著推高 F001)
-        for wx, wy in ((320, 400), (660, 300), (950, 215)):
-            page.mouse.move(wx + random.uniform(-30, 30), wy + random.uniform(-20, 20),
-                            steps=random.randint(5, 9))
-            page.wait_for_timeout(random.uniform(30, 70))
+        if not warmed:
+            _warmup_mouse(page)
         if not ('back' in captured and 'shadow' in captured):
-            for _ in range(50):
+            # 等图必须留 Playwright 调用:response hook 靠它推进
+            for _ in range(60):
                 if 'back' in captured and 'shadow' in captured:
                     break
-                page.wait_for_timeout(100)
+                page.evaluate('1')
+                time.sleep(0.02)
             if not ('back' in captured and 'shadow' in captured):
                 log('  [自动登录] 滑块图片拦截超时', 'WARNING')
                 return None, None
 
         _solve_slider(page, captured)
         log(f'  [自动登录] 拖拽完成({time.time()-t0:.1f}s)', "DEBUG")
-        # 页面在 verify 回调里自动发 userLogin,等响应
-        login = None
-        for _ in range(300):
+        # 页面在 verify 回调里自动发 userLogin,等响应。每轮 evaluate 既读结果也推进事件循环,
+        # 所以这里用 time.sleep 细颗粒轮询是安全的(旧写法 wait_for_timeout(20) 实为 31ms 一档)
+        login, deadline = None, time.time() + 8.0
+        while time.time() < deadline:
             login = page.evaluate("() => window.__login")
             if login:
                 break
-            page.wait_for_timeout(20)
+            time.sleep(0.004)
         log(f'  [自动登录] 登录响应({time.time()-t0:.1f}s)', "DEBUG")
         if not isinstance(login, dict):
             log('  [自动登录] 未捕获登录响应', 'WARNING')
@@ -665,13 +831,16 @@ def _one_attempt_mypage(page, user: str, pwd: str, captured: dict, results: dict
         token = _extract_sso_token(login)
         if token:
             log(f'  [自动登录] 滑块通过,已获取 SSO Token(本次 {time.time()-t0:.1f}s)', 'SUCCESS')
+            results['vcode'] = 'PASS'
             return token, None
         msg = str(login.get('msg') or login.get('message') or '')
         if 'F015' in msg or 'F001' in msg or '验证码' in msg:
             vcode = 'F015' if 'F015' in msg else ('F001' if 'F001' in msg else '?')
+            results['vcode'] = vcode
             log(f'  [自动登录] 滑块未通过({vcode} {_VERIFY_HINT.get(vcode, "滑块校验失败")})', 'WARNING')
             return None, None   # 可重试
         # 账密类拒绝(不存在/密码错误/冻结等),重试无意义
+        results['vcode'] = 'BIZ'
         log(f'  [自动登录] 滑块通过但登录被拒: {msg[:40]}', 'ERROR')
         return None, msg[:40] or '登录被拒'
     except Exception as e:
@@ -917,12 +1086,17 @@ class AutoSlider:
                 except Exception as e:
                     self._result_q.put(('error', f'浏览器启动失败: {str(e)[:300]}'))
                     return
-                # 窗口创建时会抢走终端焦点,立即抢回,避免用户输账密中断
-                _restore_console_focus()
                 ctx = page = None
                 captured, results = {}, {}
                 try:
+                    wins0 = set(_top_level_chrome_windows())
                     ctx, page = _new_page(browser)
+                    # 先摘掉任务栏/Alt-Tab 里的浏览器图标(窗口本身离屏,照常渲染),
+                    # 再把前台抢回终端——顺序反了会被 SetWindowPos 之后的激活干扰
+                    _silence_taskbar(wins0)
+                    # 实测抢终端前台的是"创建首个页面窗口"这一步(launch 本身不抢),
+                    # 所以必须在建页后抢回;系统激活可能稍晚,给 1.2s 轮询重试窗口。
+                    _restore_console_focus(retry_s=1.2)
                     _install_hooks(page, captured, results)
                 except Exception as e:
                     self._result_q.put(('error', f'页面创建失败: {str(e)[:60]}'))
@@ -965,8 +1139,10 @@ class AutoSlider:
             log(f'  [自动登录] 第 {i}/{max_attempts} 次尝试...', 'INFO')
             if i > 1 or not self._setup_ready:
                 if i > 1:
-                    log('  [自动登录] 等待 2s 退避后重试(防高频风控)...', 'INFO')
-                    time.sleep(2.0)
+                    # F015 属识别/映射偏差,不是行为风控,短退避即可;F001 才值得长退避
+                    back = 2.5 if results.get('vcode') == 'F001' else 0.8
+                    log(f'  [自动登录] 退避 {back}s 后重试(防高频风控)...', 'INFO')
+                    time.sleep(back)
                 captured.clear()   # 先清空,再由 _setup_mypage 重新捕获新图片
                 results.clear()
                 if not _setup_mypage(page, captured):
