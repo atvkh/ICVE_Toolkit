@@ -232,9 +232,14 @@ def _brush_progress(client: ZjyClient, nickname: str, class_id: str,
     aes_key = client.generate_aes_key() if ctype not in ("MOOC", "RESOURCE") else None
 
     # 快速模式下并行解析 MP4 时长
+    # 资源库相对短链即时解析(2026-09-20):同轮按 cellId 去重缓存,
+    # 失败同样缓存以免重试打点;只在 ctype==RESOURCE 时产生计数
+    zyk_url_cache = {}
+    zyk_resolve_stat = {"ok": 0, "fail": 0}
     mp4_duration_cache = {}
     if not simulate_real:
-        mp4_duration_cache = _parse_mp4_durations_parallel(client, nickname, leaf_cells)
+        mp4_duration_cache = _parse_mp4_durations_parallel(client, nickname, leaf_cells,
+                                                           ctype, zyk_url_cache, zyk_resolve_stat)
 
     success_count = 0
     fail_count = 0
@@ -255,7 +260,8 @@ def _brush_progress(client: ZjyClient, nickname: str, class_id: str,
 
         # 计算目标时长
         total_time = _calculate_total_time(client, nickname, cell, idx, class_id, course_info_id,
-                                            course_id, ctype, cell_type, file_url_raw, mp4_duration_cache)
+                                            course_id, ctype, cell_type, file_url_raw, mp4_duration_cache,
+                                            zyk_url_cache, zyk_resolve_stat)
 
         # 提交心跳
         submitted = _submit_heartbeat(client, nickname, cell, idx, len(leaf_cells), class_id, course_info_id,
@@ -286,12 +292,56 @@ def _brush_progress(client: ZjyClient, nickname: str, class_id: str,
 
     log(f"[{nickname}] 🎉 进度秒刷结束:成功 {success_count} 个,失败 {fail_count} 个", "INFO")
 
+    # 资源库相对短链即时解析汇总:成功/失败计数,失败仍走随机时长兜底不影响进度。
+    # 零解析动作时不输出,避免给 SPOC/MOOC 日志加噪音
+    if zyk_resolve_stat["ok"] + zyk_resolve_stat["fail"]:
+        log(f"[{nickname}] RESOURCE 相对短链即时解析:成功 {zyk_resolve_stat['ok']} 个 / "
+            f"失败 {zyk_resolve_stat['fail']} 个(失败仍用随机时长兜底,不影响进度)", "INFO")
+
     # 刷新进度
     _refresh_progress(client, ctype, course_info_id, class_id)
 
 
-def _parse_mp4_durations_parallel(client: ZjyClient, nickname: str, leaf_cells: list) -> dict:
+def _video_url_or_resolve(client: ZjyClient, ctype: str, cell: dict, raw,
+                           zyk_cache: dict, zyk_stat: Optional[dict] = None) -> str:
+    """课件视频地址提取:先按原有口径,提不到且属资源库时向平台即时解析一次。
+
+    背景(2026-09-19 普查 11 门资源库课 / 2192 个课件叶子):资源库树接口的 fileUrl 有四种
+    形态——绝对 URL、`doc|zyk/g@<HEX>.ext`、`doc/e@<HEX>.ext`、空;后两类相对短链占 64%,
+    是"未绑定知识点"那批资源的存储方式(目录分片号不可推导,本地拼前缀必 404),
+    extract_file_url 提不出地址 → 整课视频退化成随机时长冒充真实视频长度。
+    平台只在"点开单课件"的详情接口里即时解析,故此处按 cellId 补一次只读请求。
+
+    约束:仅 ctype=='RESOURCE' 触发(SPOC/MOOC 行为逐字不变);同轮按 cellId 去重缓存,
+    失败同样缓存以免重试打点;任何取不到地址的情况返回 "",由调用方原样回落随机时长,
+    绝不因此跳过课件或计入失败。
+    """
+    url = extract_file_url(raw)
+    if url or ctype != "RESOURCE":
+        return url
+    cell_id = str((cell or {}).get("id") or "")
+    if not cell_id:
+        return ""
+    if cell_id not in zyk_cache:
+        try:
+            resolved = client.zyk_get_cell_file_url(cell_id)
+        except Exception:
+            resolved = ""
+        # 双保险:客户端层已限定只回绝对地址,这里再校验一次,
+        # 防未来实现松动时把相对串直接送进 Range 请求(表现为"解析异常"噪音)
+        resolved = resolved if str(resolved or "").startswith("http") else ""
+        zyk_cache[cell_id] = resolved
+        if zyk_stat is not None:
+            zyk_stat["ok" if zyk_cache[cell_id] else "fail"] += 1
+    return zyk_cache[cell_id]
+
+
+def _parse_mp4_durations_parallel(client: ZjyClient, nickname: str, leaf_cells: list,
+                                   ctype: str = "SPOC", zyk_cache: Optional[dict] = None,
+                                   zyk_stat: Optional[dict] = None) -> dict:
     """并行解析所有视频课件的 MP4 时长。"""
+    if zyk_cache is None:
+        zyk_cache = {}
     mp4_parse_tasks = []
     for _idx, _cell in enumerate(leaf_cells):
         _cell_type = (_cell.get("fileType") or "").lower()
@@ -308,7 +358,8 @@ def _parse_mp4_durations_parallel(client: ZjyClient, nickname: str, leaf_cells: 
     def _parse(task):
         _i, _c = task
         try:
-            _ori_url = extract_file_url(_c.get("fileUrl"))
+            _ori_url = _video_url_or_resolve(client, ctype, _c, _c.get("fileUrl"),
+                                             zyk_cache, zyk_stat)
             if _ori_url:
                 # 音频课件先走 MP3 解析(生产 2026-09-16 消噪移植):MP3 无 moov box,
                 # 直进 MP4 三策略必失败;先 MP3、失败回落 MP4(m4a 实为 MP4 容器,双跳零回归)。
@@ -333,7 +384,9 @@ def _parse_mp4_durations_parallel(client: ZjyClient, nickname: str, leaf_cells: 
 
 def _calculate_total_time(client: ZjyClient, nickname: str, cell: dict, idx: int,
                            class_id: str, course_info_id: str, course_id: str,
-                           ctype: str, cell_type: str, file_url_raw, mp4_cache: dict) -> int:
+                           ctype: str, cell_type: str, file_url_raw, mp4_cache: dict,
+                           zyk_cache: Optional[dict] = None,
+                           zyk_stat: Optional[dict] = None) -> int:
     """计算课件的目标学习时长(秒)。
 
     优化:不再对每个课件串行查询 spoc/studyRecord/list(385个课件=385次HTTP请求,极慢)。
@@ -341,6 +394,8 @@ def _calculate_total_time(client: ZjyClient, nickname: str, cell: dict, idx: int
     """
     total_time = None
     spoc_record_time = None
+    if zyk_cache is None:
+        zyk_cache = {}
 
     # 从 studentStudyRecord 获取时长(本地数据,无网络请求)
     record_time = None
@@ -377,7 +432,8 @@ def _calculate_total_time(client: ZjyClient, nickname: str, cell: dict, idx: int
             mp4_time = cached_dur
         else:
             try:
-                ori_url = extract_file_url(file_url_raw)
+                ori_url = _video_url_or_resolve(client, ctype, cell, file_url_raw,
+                                                zyk_cache, zyk_stat)
                 if ori_url:
                     # 音频先 MP3 解析(同并行路径),失败回落 MP4
                     parsed = None

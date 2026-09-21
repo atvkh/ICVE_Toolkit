@@ -641,6 +641,28 @@ class ZjyClient:
                 return rows
         return []
 
+    def zyk_get_cell_file_url(self, cell_id: str) -> str:
+        """资源库相对短链课件即时解析:GET teacher/courseContent/{cellId} → 绝对 fileUrl
+
+        抓包实证(2026-09-19,11 门资源库课 2192 个课件叶子普查):树/列表接口的 fileUrl 有四种
+        形态——绝对 URL(630)、`doc|zyk/g@<HEX>.ext`(845)、`doc/e@<HEX>.ext`(558)、空(159)。
+        后两类相对短链 = 未绑定知识点(knowledgePointsId 为空)的那批资源,平台库里只存相对键,
+        仅在"点开单课件"的详情接口里即时解析(目录分片号不可推导,本地拼前缀必 404)。
+        该接口不校验课程归属,学生号 zyk_token 即可;只读、无副作用。
+        返回:绝对地址;其余一律 ""(无 token / 非 200 / 仍是相对 / 异常)交调用方回落原兜底。
+        """
+        if not cell_id:
+            return ""
+        if not self.zyk_token and not self.auth_zyk_domain():
+            return ""
+        try:
+            data = self.api_get_zyk(f"teacher/courseContent/{cell_id}")
+        except Exception:
+            return ""
+        inner = data.get("data") if isinstance(data, dict) else None
+        url = inner.get("fileUrl") if isinstance(inner, dict) else ""
+        return url if str(url or "").startswith("http") else ""
+
     def zyk_get_course_tree(self, course_info_id: str) -> list:
         """资源库课程树:先拉 studyMoudleList 取模块,再递归 studyList 取子节点。
 
