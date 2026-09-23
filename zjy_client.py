@@ -171,6 +171,12 @@ class ZjyClient:
         self.stu_id: Optional[str] = None
         self.ai_token: Optional[str] = None
         self.zyk_token: Optional[str] = None
+        # 换票失败原因（平台原话）：此前 allowLogin=false 被直接吞掉，日志里连一行都没有，
+        # 用户只能看到"没有扫描到可刷的课件"，误以为功能坏了。
+        self.ai_auth_msg: str = ""
+        self.zyk_auth_msg: str = ""
+        # 读请求异常次数：**"没读到"不等于"没有内容"**，扫描返回 0 时靠它区分两者
+        self.net_err: int = 0
         # 题库目录(可选):无则跳过题库兜底
         self.question_bank_dir: Optional[str] = question_bank_dir
         # 同学账号 token 字典(可选):{nickname: {"token":..., "stuId":...}}
@@ -243,10 +249,16 @@ class ZjyClient:
             return False
 
     def auth_ai_domain(self) -> bool:
-        """AI 域鉴权:用 sso_token(优先)或 token 换 ai_token。"""
+        """AI 域鉴权:用 sso_token(优先)或 token 换 ai_token。
+
+        失败原因留在 `self.ai_auth_msg`（平台的 `notAllowLoginMsg` 原话）——官方在"登录态过期"时
+        回的是 HTTP 200 + `{"code":200,"data":{"allowLogin":false,...}}`，吞掉它就只会表现为
+        "MOOC 课件树扫出 0 个课件"，用户无从知道是登录态问题。
+        """
         try:
             auth_token = self.sso_token or self.token
             if not auth_token:
+                self.ai_auth_msg = "本地无 token（未登录）"
                 return False
             clean_headers = {k: v for k, v in self.session.headers.items()
                              if k.lower() not in ("authorization", "x-ai-token")}
@@ -263,8 +275,16 @@ class ZjyClient:
                     if ai_token:
                         self.ai_token = ai_token
                         self.session.headers["X-AI-Token"] = f"Bearer {ai_token}"
+                        self.ai_auth_msg = ""
                         return True
+                self.ai_auth_msg = _passlogin_reject(data)
+                log(f"[AI鉴权] 换票被拒：{self.ai_auth_msg}", "WARNING")
+                return False
+            self.ai_auth_msg = f"AI 域 passLogin HTTP {resp.status_code}"
+            log(f"[AI鉴权] {self.ai_auth_msg}", "WARNING")
         except Exception as e:
+            self.net_err += 1
+            self.ai_auth_msg = f"AI 域换票请求异常: {e}"
             log(f"auth_ai_domain 异常: {e}", "ERROR")
         return False
 
@@ -273,10 +293,12 @@ class ZjyClient:
 
         抓包确认:GET https://zyk.icve.com.cn/prod-api/auth/passLogin?token=<ssoToken>
         返回 {code:200, data:{access_token, expires_in:1440}}
+        失败原因同样留在 `self.zyk_auth_msg`（吞掉时表现为"资源库一门课都列不出来"）。
         """
         try:
             auth_token = self.sso_token or self.token
             if not auth_token:
+                self.zyk_auth_msg = "本地无 token（未登录）"
                 return False
             clean_headers = {k: v for k, v in self.session.headers.items()
                              if k.lower() not in ("authorization", "x-ai-token")}
@@ -293,8 +315,16 @@ class ZjyClient:
                     zyk_token = _extract_access_token(data)
                     if zyk_token:
                         self.zyk_token = zyk_token
+                        self.zyk_auth_msg = ""
                         return True
+                self.zyk_auth_msg = _passlogin_reject(data)
+                log(f"[资源库鉴权] 换票被拒：{self.zyk_auth_msg}", "WARNING")
+                return False
+            self.zyk_auth_msg = f"资源库域 passLogin HTTP {resp.status_code}"
+            log(f"[资源库鉴权] {self.zyk_auth_msg}", "WARNING")
         except Exception as e:
+            self.net_err += 1
+            self.zyk_auth_msg = f"资源库域换票请求异常: {e}"
             log(f"auth_zyk_domain 异常: {e}", "ERROR")
         return False
 
@@ -401,53 +431,70 @@ class ZjyClient:
             self.ensure_ai_token()
         return {"Authorization": f"Bearer {self.ai_token}"} if self.ai_token else {}
 
-    def api_get_ai(self, path: str, params: Optional[dict] = None, timeout: int = 10) -> Optional[dict]:
-        """AI 域 GET,401 时自动重新鉴权重试一次。"""
-        try:
+    def _ai_auth_rejected(self, status: int, body) -> bool:
+        """判断一次 AI 域响应是不是"登录态失效"。
+
+        实测：官方把鉴权失效包在 **HTTP 200 + body `{"code":401,"msg":"登录状态已过期"}`** 里返回，
+        所以只盯 HTTP 状态码的旧逻辑永远不会重鉴权（表现为"课程树扫出 0 个课件"，被误当成没课件）。
+        """
+        if status == 401:
+            return True
+        return isinstance(body, dict) and body.get("code") == 401
+
+    def _ai_request(self, verb: str, path: str, params=None, body=None, timeout: int = 10):
+        """AI 域请求内核：发一次 → 若是登录态失效就换票重发一次。
+
+        三种返回口径保持不变：HTTP 200 时返回解析后的 dict，否则 None；
+        唯一新增的是"body 级 401 也会先重鉴权再试一次"。
+        """
+        url = f"{AI_BASE_URL}/{path}"
+
+        def _send():
             headers = self._ai_headers()
-            resp = self.session.get(f"{AI_BASE_URL}/{path}", params=params, headers=headers, timeout=timeout)
-            if resp.status_code == 401:
-                self.auth_ai_domain()
-                if self.ai_token:
-                    headers["Authorization"] = f"Bearer {self.ai_token}"
-                resp = self.session.get(f"{AI_BASE_URL}/{path}", params=params, headers=headers, timeout=timeout)
+            if verb == "GET":
+                return self.session.get(url, params=params, headers=headers, timeout=timeout)
+            if verb == "POST":
+                return self.session.post(url, json=body, headers=headers, timeout=timeout)
+            return self.session.put(url, json=body, headers=headers, timeout=timeout)
+
+        try:
+            resp = _send()
+            parsed = None
             if resp.status_code == 200:
-                return resp.json()
+                try:
+                    parsed = resp.json()
+                except Exception:
+                    parsed = None
+            if self._ai_auth_rejected(resp.status_code, parsed):
+                # 鉴权失效属于"读不到"，计入 net_err 供上层区分"没课件"
+                self.net_err += 1
+                if self.auth_ai_domain():
+                    resp = _send()
+                    if resp.status_code == 200:
+                        try:
+                            return resp.json()
+                        except Exception:
+                            return None
+                    return None
+                return parsed
+            if resp.status_code == 200:
+                return parsed
         except Exception as e:
-            log(f"GET(AI) {path} 异常: {e}", "ERROR")
+            self.net_err += 1
+            log(f"{verb.upper()}(AI) {path} 异常: {e}", "ERROR")
         return None
+
+    def api_get_ai(self, path: str, params: Optional[dict] = None, timeout: int = 10) -> Optional[dict]:
+        """AI 域 GET；登录态失效（含 body 级 code=401）时自动换票重试一次。"""
+        return self._ai_request("GET", path, params=params, timeout=timeout)
 
     def api_post_ai(self, path: str, body: Optional[dict] = None, timeout: int = 10) -> Optional[dict]:
-        """AI 域 POST,401 时自动重新鉴权重试一次。"""
-        try:
-            headers = self._ai_headers()
-            resp = self.session.post(f"{AI_BASE_URL}/{path}", json=body, headers=headers, timeout=timeout)
-            if resp.status_code == 401:
-                self.auth_ai_domain()
-                if self.ai_token:
-                    headers["Authorization"] = f"Bearer {self.ai_token}"
-                resp = self.session.post(f"{AI_BASE_URL}/{path}", json=body, headers=headers, timeout=timeout)
-            if resp.status_code == 200:
-                return resp.json()
-        except Exception as e:
-            log(f"POST(AI) {path} 异常: {e}", "ERROR")
-        return None
+        """AI 域 POST；登录态失效（含 body 级 code=401）时自动换票重试一次。"""
+        return self._ai_request("POST", path, body=body, timeout=timeout)
 
     def api_put_ai(self, path: str, body: Optional[dict] = None, timeout: int = 10) -> Optional[dict]:
-        """AI 域 PUT。"""
-        try:
-            headers = self._ai_headers()
-            resp = self.session.put(f"{AI_BASE_URL}/{path}", json=body, headers=headers, timeout=timeout)
-            if resp.status_code == 401:
-                self.auth_ai_domain()
-                if self.ai_token:
-                    headers["Authorization"] = f"Bearer {self.ai_token}"
-                resp = self.session.put(f"{AI_BASE_URL}/{path}", json=body, headers=headers, timeout=timeout)
-            if resp.status_code == 200:
-                return resp.json()
-        except Exception as e:
-            log(f"PUT(AI) {path} 异常: {e}", "ERROR")
-        return None
+        """AI 域 PUT；登录态失效（含 body 级 code=401）时自动换票重试一次。"""
+        return self._ai_request("PUT", path, body=body, timeout=timeout)
 
     # ==================== 资源库域 API ====================
 
@@ -767,8 +814,16 @@ class ZjyClient:
         """
         # 资源库域:直接用 zyk_get_course_tree 返回的叶子节点
         if ctype == "RESOURCE":
+            if not self.zyk_token and not self.auth_zyk_domain():
+                log(f"[扫描-RESOURCE] 资源库域换票失败：{self.zyk_auth_msg or '未知原因'}"
+                    f" ⇒ 读不到课件树（这不是「没有课件」），请重新登录后再刷", "ERROR")
+                return []
             leaves = self.zyk_get_course_tree(course_info_id, leaf_workers=leaf_workers)
-            leaf_cells = [l for l in leaves if (l.get("fileType") or "") not in ["作业", "考试", "测验", "exam", "homework"]]
+            # 2026-09-23 真机定口径：平台 studySpeed 的分母 = **全部叶子 −「作业」格**，
+            # 测验/考试/讨论都在分母内（25 门课反算吻合；把 1 个测验格标满后该课 99→100）。
+            # 而作业格压根不是课件：两种心跳形都被平台回 code=400「不存在该课件！」，且不计进度。
+            # 旧写法把 考试/测验 一并剔出扫描 ⇒ 这两类格永远补不满，课最多只能到 96~99%。
+            leaf_cells = [l for l in leaves if (l.get("fileType") or "") not in ["作业", "exam", "homework"]]
             # 已刷过的资源库课,叶子上带 studentStudyRecord(含 speed/actualNum/totalNum)。
             # 早先这里无条件写 _speed=0,等于告诉调用方"全课都没刷过",于是每点一次刷课
             # 就把全课几千格重打一遍;现按平台口径回填,读不到时仍是 0(只多刷不漏刷)。
@@ -846,6 +901,13 @@ class ZjyClient:
                     if ftype == "知识点讲解" and ctype != "MOOC":
                         r["_is_knowledge_explain"] = True
                     leaf_cells.append(r)
+
+        # MOOC 课件树全部走 AI 域；先确保有票，无票时逐容器请求只会拿到"业务码 401/空列表"，
+        # 结果被误读成"这门课没课件"。这里显式失败并给出平台原话。
+        if ctype == "MOOC" and not self.ensure_ai_token():
+            log(f"[扫描-MOOC] AI 域换票失败：{self.ai_auth_msg or '未知原因'}"
+                f" ⇒ 读不到课件树（这不是「没有课件」），请重新登录后再刷", "ERROR")
+            return []
 
         rows_l1 = self._fetch_course_tree_level(course_info_id, class_id, course_id, 1, "0", ctype)
         if rows_l1:
@@ -2145,6 +2207,21 @@ class ZjyClient:
 
 
 # ==================== 模块级辅助函数 ====================
+
+def _passlogin_reject(data) -> str:
+    """把 passLogin 的"换票被拒"翻成一句人话（平台原话优先）。
+
+    实测登录态过期时回 HTTP 200 + `{"code":200,"data":{"allowLogin":false,
+    "notAllowLoginMsg":"用户信息为空！"}}`：HTTP 与业务 code 都"成功"，只有 data 里在拒绝。
+    """
+    d = (data or {}).get("data") if isinstance(data, dict) else None
+    if isinstance(d, dict):
+        msg = str(d.get("notAllowLoginMsg") or "").strip()
+        if msg:
+            return msg + ("（登录态已过期，请重新登录）" if d.get("allowLogin") is False else "")
+    code = (data or {}).get("code") if isinstance(data, dict) else None
+    return f"平台未返回 access_token（code={code}）"
+
 
 def _extract_access_token(data: dict) -> Optional[str]:
     """从 passLogin 响应中提取 access_token,兼容 dict 和 str 两种 data 格式。"""

@@ -63,6 +63,48 @@ MOOC_LANE_DISPATCH_GAP = 0.2
 _LANE_POOL = ThreadPoolExecutor(max_workers=MOOC_LANES, thread_name_prefix="mooc-lane")
 
 
+def _scan_blocked_reason(client, ctype, net_base=0) -> str:
+    """课件清单为空时判断"是读不到还是没有课件"，返回原因文本（空串=没有可报告的失败）。
+
+    MOOC 的清单全在 AI 域、资源库的清单全在 zyk 域，两域都是**换票失败就什么都读不到**；
+    而平台的鉴权失效响应形如 HTTP 200 + `{"code":401}`/`data.allowLogin=false`，
+    不专门看就会当成"这门课没有课件"。
+    """
+    if ctype == "MOOC" and getattr(client, "ai_auth_msg", ""):
+        return f"AI 域换票失败：{client.ai_auth_msg}"
+    if ctype == "RESOURCE" and getattr(client, "zyk_auth_msg", ""):
+        return f"资源库域换票失败：{client.zyk_auth_msg}"
+    _n = (getattr(client, "net_err", 0) or 0) - (net_base or 0)
+    if isinstance(_n, int) and _n > 0:
+        return f"读请求异常 {_n} 次"
+    return ""
+
+
+# 心跳阶段跳过的"非课件"类型：资源库只跳作业（测验/考试/讨论都计进 studySpeed 分母，
+# 实测走计数形一跳即可标满），其余类型照旧跳全部六类（红线：口径逐字不变）
+_SKIP_FT_COMMON = ["作业", "测验", "考试", "讨论", "exam", "homework"]
+_SKIP_FT_ZYK = ["作业", "exam", "homework"]
+
+
+def _skip_fts(ctype: str) -> list:
+    return _SKIP_FT_ZYK if ctype == "RESOURCE" else _SKIP_FT_COMMON
+
+
+# 资源库里"计进度但没有可看的媒体"的格：fileUrl 为空、按视频时长刷不动，
+# 实测走图片同款计数形（totalNum=actualNum=1）一跳即 speed=100
+ZYK_TASK_TYPES = ("测验", "考试", "讨论")
+
+
+def _zyk_mark_task(leaf_cells: list) -> int:
+    """给资源库的 测验/考试/讨论 格打纳管标记（计数形单跳标满），返回标记格数。"""
+    n = 0
+    for c in leaf_cells or []:
+        if (c.get("fileType") or "") in ZYK_TASK_TYPES:
+            c["_zyk_task"] = True
+            n += 1
+    return n
+
+
 def _zyk_mark_swf(leaf_cells: list) -> int:
     """给资源库的 `.swf` 课件打纳管标记（心跳改走计数形单次上报），返回标记格数。"""
     n = 0
@@ -285,18 +327,29 @@ def _brush_progress(client: ZjyClient, nickname: str, class_id: str,
 
     # 资源库课件树按层并发扫描；其余类型不传宽度 = 原口径逐字不变
     _scan_w = RESOURCE_SCAN_WORKERS if ctype == "RESOURCE" else None
+    _net0 = getattr(client, "net_err", 0) or 0
     # 先扫描未完成的课件
     leaf_cells = client.get_course_cells(course_info_id, class_id, course_id, include_completed=False,
                                          ctype=ctype, leaf_workers=_scan_w)
-    leaf_cells = [c for c in leaf_cells if (c.get("fileType") or "") not in ["作业", "测验", "考试", "讨论", "exam", "homework"]]
+    leaf_cells = [c for c in leaf_cells if (c.get("fileType") or "") not in _skip_fts(ctype)]
+
+    # 清单为空有两种完全不同的原因："真的都刷完了" 与 "根本没读到"（换票失败/网络异常）。
+    # 旧代码一律当前者，于是登录态过期时用户看到的是"所有课件已完成"，以为功能坏了。
+    _blocked = _scan_blocked_reason(client, ctype, _net0)
+    if _blocked:
+        log(f"[{nickname}] ⛔ 课件清单没读到（{_blocked}）——这不是「全部已完成」，本轮不刷进度；"
+            f"请到主菜单重新登录后再试", "ERROR")
+        return
     # 资源库心跳统计（免发/SWF 通道），只 RESOURCE 分支读写
     zyk_swf_stat = {"ok": 0, "noop": 0, "skipped": 0, "disabled": False}
+    # 测验/考试/讨论 单独一账：一种被平台拒绝不得牵连另一种（也不进连续失败熔断）
+    zyk_task_stat = {"ok": 0, "noop": 0, "skipped": 0, "disabled": False}
     zyk_noop_stat = {"skipped": 0, "beats_saved": 0, "fallback": 0}
 
     def _swf_gate(_cells):
-        """.swf 分流：资源库纳管（打标记走计数形），其余类型照旧整格跳过（口径一字未动）。"""
+        """计数形纳管分流：资源库给 .swf 与 测验/考试/讨论 打标记，其余类型照旧整格跳过。"""
         if ctype == "RESOURCE":
-            return _cells, _zyk_mark_swf(_cells)
+            return _cells, _zyk_mark_swf(_cells) + _zyk_mark_task(_cells)
         _sk = [c for c in _cells if ".swf" in (c.get("fileUrl") or "")]
         if _sk:
             _cells = [c for c in _cells if ".swf" not in (c.get("fileUrl") or "")]
@@ -307,7 +360,7 @@ def _brush_progress(client: ZjyClient, nickname: str, class_id: str,
     leaf_cells, _swf_n = _swf_gate(leaf_cells)
     if _swf_n:
         log(f"[{nickname}] "
-            + (f"纳管 {_swf_n} 个 SWF 动画课件（计数形单次心跳）" if ctype == "RESOURCE"
+            + (f"纳管 {_swf_n} 个 SWF 动画/测验/考试/讨论课件（计数形单次心跳）" if ctype == "RESOURCE"
                else f"跳过 {_swf_n} 个 SWF 动画课件(平台不支持心跳刷时长)"), "INFO")
 
     # 全部已完成则重刷(加时长)
@@ -315,12 +368,12 @@ def _brush_progress(client: ZjyClient, nickname: str, class_id: str,
         log(f"[{nickname}] 所有课件已完成,将全部重刷以增加时长...", "INFO")
         leaf_cells = client.get_course_cells(course_info_id, class_id, course_id, include_completed=True,
                                              ctype=ctype, leaf_workers=_scan_w)
-        leaf_cells = [c for c in leaf_cells if (c.get("fileType") or "") not in ["作业", "测验", "考试", "讨论", "exam", "homework"]]
+        leaf_cells = [c for c in leaf_cells if (c.get("fileType") or "") not in _skip_fts(ctype)]
         # SWF 同款分流（重刷分支，口径同上）
         leaf_cells, _swf_n2 = _swf_gate(leaf_cells)
         if _swf_n2:
             log(f"[{nickname}] "
-                + (f"纳管 {_swf_n2} 个 SWF 动画课件（重刷分支）" if ctype == "RESOURCE"
+                + (f"纳管 {_swf_n2} 个 SWF 动画/测验/考试/讨论课件（重刷分支）" if ctype == "RESOURCE"
                    else f"跳过 {_swf_n2} 个 SWF 动画课件(重刷分支)"), "INFO")
         # 跳过已完成的图片课件(重刷会导致进度回退)
         # SPOC 图片课件 fileType 主值是 'img'（不在 IMAGE_TYPES 集合），同为计数型 totalNum=1
@@ -338,7 +391,11 @@ def _brush_progress(client: ZjyClient, nickname: str, class_id: str,
             log(f"[{nickname}] 跳过 {_skipped_img} 个已完成的图片课件(避免重刷导致进度回退)", "INFO")
 
     if not leaf_cells:
-        log(f"[{nickname}] 没有扫描到可刷的进度课件", "INFO")
+        _b2 = _scan_blocked_reason(client, ctype, _net0)
+        if _b2:
+            log(f"[{nickname}] ⛔ 重扫仍没读到课件清单（{_b2}），本轮不刷进度", "ERROR")
+        else:
+            log(f"[{nickname}] 没有扫描到可刷的进度课件", "INFO")
         return
 
     log(f"[{nickname}] 找到 {len(leaf_cells)} 个课件，开始提交心跳...", "INFO")
@@ -392,7 +449,7 @@ def _brush_progress(client: ZjyClient, nickname: str, class_id: str,
         # 提交心跳
         status = _submit_heartbeat(client, nickname, cell, idx, len(leaf_cells), class_id, course_info_id,
                                    course_id, ctype, cell_type, total_time, aes_key, simulate_real,
-                                   lane_ctx, zyk_swf_stat, zyk_noop_stat)
+                                   lane_ctx, zyk_swf_stat, zyk_noop_stat, zyk_task_stat)
 
         if status == "skip":
             # 平台明确不接受的通道（本课已关闭 SWF 上报）：静默跳过，不进熔断计数
@@ -455,6 +512,10 @@ def _brush_progress(client: ZjyClient, nickname: str, class_id: str,
     if ctype == "RESOURCE" and zyk_noop_stat["skipped"]:
         log(f"[{nickname}] RESOURCE 心跳去重:平台位置已达标免发 {zyk_noop_stat['skipped']} 个课件"
             f"（省下约 {zyk_noop_stat['beats_saved']} 条重复上报）", "INFO")
+    if ctype == "RESOURCE" and (zyk_task_stat["ok"] + zyk_task_stat["noop"] + zyk_task_stat["skipped"]):
+        _tt = f"，通道被拒后跳过 {zyk_task_stat['skipped']} 个" if zyk_task_stat["skipped"] else ""
+        _tt += f"，平台已满免发 {zyk_task_stat['noop']} 个" if zyk_task_stat["noop"] else ""
+        log(f"[{nickname}] RESOURCE 测验/考试/讨论纳管:计数形心跳标满 {zyk_task_stat['ok']} 个{_tt}", "INFO")
     if ctype == "RESOURCE" and (zyk_swf_stat["ok"] + zyk_swf_stat["noop"] + zyk_swf_stat["skipped"]):
         _dt = f"，本课已关闭该通道跳过 {zyk_swf_stat['skipped']} 个" if zyk_swf_stat["skipped"] else ""
         _dt += f"，平台已满免发 {zyk_swf_stat['noop']} 个" if zyk_swf_stat["noop"] else ""
@@ -697,7 +758,8 @@ def _submit_heartbeat(client: ZjyClient, nickname: str, cell: dict, idx: int, to
                       aes_key: Optional[str], simulate_real: bool,
                       lane_ctx: Optional[dict] = None,
                       zyk_swf_stat: Optional[dict] = None,
-                      zyk_noop_stat: Optional[dict] = None) -> str:
+                      zyk_noop_stat: Optional[dict] = None,
+                      zyk_task_stat: Optional[dict] = None) -> str:
     """提交心跳包,根据课程类型走不同分支。
 
     返回 `"ok"`/`"fail"`（三类通用），资源库另可返回 `"noop"`（平台已记满，无需上报）
@@ -713,7 +775,9 @@ def _submit_heartbeat(client: ZjyClient, nickname: str, cell: dict, idx: int, to
                                           zyk_swf_stat if zyk_swf_stat is not None else
                                           {"ok": 0, "noop": 0, "skipped": 0, "disabled": False},
                                           zyk_noop_stat if zyk_noop_stat is not None else
-                                          {"skipped": 0, "beats_saved": 0, "fallback": 0})
+                                          {"skipped": 0, "beats_saved": 0, "fallback": 0},
+                                          zyk_task_stat if zyk_task_stat is not None else
+                                          {"ok": 0, "noop": 0, "skipped": 0, "disabled": False})
     else:
         ok = _submit_spoc_heartbeat(client, nickname, cell, class_id, course_info_id,
                                     course_id, cell_type, total_time, aes_key, simulate_real)
@@ -958,7 +1022,8 @@ def _mooc_fast_concurrent(client: ZjyClient, payloads: list,
 def _submit_resource_heartbeat(client: ZjyClient, nickname: str, cell: dict,
                                 course_info_id: str, course_id: str,
                                 cell_type: str, total_time: int,
-                                swf_stat: dict, noop_stat: dict) -> str:
+                                swf_stat: dict, noop_stat: dict,
+                                task_stat: Optional[dict] = None) -> str:
     """资源库心跳提交:zyk 域明文 JSON,URL 末尾斜杠必需。
 
     三条口径（实测，与旧"同一位置重复发 total_time//10 条"的差别就是资源库慢的真凶）：
@@ -966,14 +1031,16 @@ def _submit_resource_heartbeat(client: ZjyClient, nickname: str, cell: dict,
        ⇒ 改申报式递增流：每格最多 `ZYK_MAX_HOPS` 跳、末条精确等于 total_time；
     ② 不从用户已看位置续推，流起点恒 0（平台位置只增，低位置申报被忽略不会倒退）；
        平台 speed 已满的格整格免发——再发也不增加任何东西；
-    ③ `.swf` 动画走图片同款计数形（totalNum=actualNum=1）单跳即满。首格被拒即对本课关闭
-       该通道并跳过其余 SWF，**不计失败**（连败会触发熔断把整门课拖死）。
+    ③ 「计进度但没有可看媒体」的格——`.swf` 动画与 测验/考试/讨论——走图片同款计数形
+       （totalNum=actualNum=1）单跳即满；首格被拒即对本课关闭**该条通道**并跳过剩余格，
+       **不计失败**（连败会触发熔断把整门课拖死）。两条通道**分账**，一种被拒不牵连另一种。
 
     :return: "ok" 已达标 / "noop" 平台已满免发 / "skip" 本课已关闭该通道 / "fail" 失败
     """
     cell_id = cell.get("id")
     is_image = cell_type in IMAGE_TYPES
     is_swf = bool(cell.get("_zyk_swf"))
+    is_task = bool(cell.get("_zyk_task"))
     cell_parent_id = cell.get("parentId", "") or ""
     speed = _zyk_cell_speed(cell)
 
@@ -988,18 +1055,23 @@ def _submit_resource_heartbeat(client: ZjyClient, nickname: str, cell: dict,
             return None
         return bool(r and (r.get("code") == 200 or r.get("code") == 0))
 
-    if is_swf:
-        if swf_stat["disabled"]:
-            swf_stat["skipped"] += 1
+    # 计数形通道：SWF 与 测验/考试/讨论 各自一个开关、各自记账
+    _cnt_stat = swf_stat if is_swf else ((task_stat if task_stat is not None
+                                          else {"ok": 0, "noop": 0, "skipped": 0, "disabled": False})
+                                         if is_task else None)
+    _cnt_name = "SWF 课件" if is_swf else "测验/考试/讨论格"
+    if _cnt_stat is not None:
+        if _cnt_stat["disabled"]:
+            _cnt_stat["skipped"] += 1
             return "skip"
         if speed >= 100:
-            swf_stat["noop"] += 1           # 满格免发，区别于"真发了一跳"
+            _cnt_stat["noop"] += 1          # 满格免发，区别于"真发了一跳"
             return "noop"
         if _beat(1, 1, True):
-            swf_stat["ok"] += 1
+            _cnt_stat["ok"] += 1
             return "ok"
-        swf_stat["disabled"] = True
-        log(f"[{nickname}] ⚠️ SWF 课件心跳被平台拒绝 → 本课剩余 SWF 直接跳过、不计失败"
+        _cnt_stat["disabled"] = True
+        log(f"[{nickname}] ⚠️ {_cnt_name}心跳被平台拒绝 → 本课剩余 {_cnt_name}直接跳过、不计失败"
             f"(id={cell_id}, name={cell.get('name','?')})", "WARNING")
         return "skip"
 
