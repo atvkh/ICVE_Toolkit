@@ -58,6 +58,38 @@ RESOURCE_PARSE_WORKERS = 12
 MOOC_LANES = 12
 # 车道模式下的派发间隔（秒）：只防本地瞬时打满，不承担平台限速职责。
 MOOC_LANE_DISPATCH_GAP = 0.2
+# MOOC 真实时长档：心跳**条数**由"要攒的秒数"决定，而要攒的秒数 = 平台树里的 videoTime
+# （实测 时长 = 5 秒 × 被接受条数、与墙钟无关；完成度 = 末条 actualNum ÷ 申报 totalNum）。
+# 旧口径给每格虚增到 random(1200,2400) 秒，于是非图片格固定 240~480 条心跳——
+# 12 门课 2138 格实测要发 48.1 万条，而按真实时长只需 8.9 万条（5.4 倍差距），
+# 且其中 828/899 次媒体头解析出来的值 <1200 秒、算完即丢。本档同时消掉这两笔成本。
+MOOC_BEAT_STEP = 5.0          # 与官方播放器抓包节奏一致（实测严格 5.0 秒一条）
+MOOC_IMG_SECONDS = 20.0       # 图片类：平台不给长度时的申报值
+MOOC_DEFAULT_SECONDS = 60.0   # 文档/音频/未知类型同上（音频若能解析出真实长度则用解析值）
+
+
+def _mooc_is_img(cell_type: str) -> bool:
+    """MOOC 图片类判定：fileType 主值是 'img'，不在全局 IMAGE_TYPES 集合内。"""
+    return cell_type in IMAGE_TYPES or cell_type == "img"
+
+
+def _mooc_video_time(cell: dict) -> float:
+    """平台树自带的真实长度（秒）；缺失/空串/非数字一律 0.0（=不确定，照旧解析）。"""
+    try:
+        return float(str((cell or {}).get("videoTime") or "").strip() or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _mooc_target_seconds(cell: dict, parsed_media_sec=None, cell_type: str = "") -> float:
+    """该课件要攒的学习秒数：videoTime > 已解析媒体秒数 > 按类型定值。恒 >0（实测 0 被回 205）。"""
+    v = _mooc_video_time(cell)
+    if v > 0:
+        return v
+    if parsed_media_sec and parsed_media_sec > 0:
+        return float(parsed_media_sec)
+    return MOOC_IMG_SECONDS if _mooc_is_img(cell_type) else MOOC_DEFAULT_SECONDS
+
 
 # MOOC 车道池：模块级复用，线程只在提交时创建
 _LANE_POOL = ThreadPoolExecutor(max_workers=MOOC_LANES, thread_name_prefix="mooc-lane")
@@ -417,8 +449,43 @@ def _brush_progress(client: ZjyClient, nickname: str, class_id: str,
     # 只有 MOOC 快速模式进入本块；SPOC/RESOURCE/模拟真实模式 lane_ctx 恒 None（红线）。
     lane_ctx = None
     if ctype == "MOOC" and not simulate_real and MOOC_LANES > 1:
-        lane_ctx = {"running": set(), "futs": [], "api": None}
-        log(f"[{nickname}] 跨课件并行已启用：车道={MOOC_LANES}（每课件内部严格串行）", "INFO")
+        lane_ctx = {"running": set(), "futs": [], "api": None, "done": 0, "beats": 0, "zero": 0,
+                    "sent": 0, "t0": time.time(), "t_note": 0.0}
+
+        def _lane_reap():
+            """收割已完成车道，按节流打一条"还在跑"的进度行。
+
+            逐格 ✅ 留给派发时打（与刷 SPOC 时的输出顺序一致：序号必然递增），
+            这里只负责"中段不静默"——车道并发下完成顺序天然乱序，逐格打就成了乱序。
+            """
+            left = []
+            for nm, f in lane_ctx["futs"]:
+                if f.done():
+                    try:
+                        n = f.result() or 0
+                    except Exception:
+                        n = 0
+                    lane_ctx["done"] += 1
+                    lane_ctx["beats"] += n
+                    if n == 0:
+                        lane_ctx["zero"] += 1
+                        log(f"[{nickname}] 刷进度 ❌ {nm} 车道内全部心跳未被接受", "WARNING")
+                else:
+                    left.append((nm, f))
+            lane_ctx["futs"][:] = left
+            lane_ctx["running"] = {f for f in lane_ctx["running"] if not f.done()}
+            # 存活证据：每 ~25 秒一条（一条 390 格的课能稳稳定点报，不会再看着像卡死）
+            _el = time.time() - lane_ctx["t0"]
+            if lane_ctx["futs"] and _el - lane_ctx["t_note"] >= 25:
+                lane_ctx["t_note"] = _el
+                _rate = lane_ctx["beats"] / max(1.0, _el)
+                log(f"[{nickname}] [车道] 进行中：已派发 {lane_ctx['sent']}/{len(leaf_cells)} 格、"
+                    f"已完成 {lane_ctx['done']} 格、被接受 {lane_ctx['beats']} 条心跳、"
+                    f"在飞 {len(lane_ctx['running'])} 车道、均速 {_rate:.0f} 条/秒"
+                    f"，已用 {_el:.0f} 秒", "INFO")
+
+        log(f"[{nickname}] 跨课件并行已启用：车道={MOOC_LANES}（每课件内部严格串行），"
+            f"每格派发即报一行，另每 25 秒报一次总进度", "INFO")
 
     success_count = 0
     fail_count = 0
@@ -455,12 +522,23 @@ def _brush_progress(client: ZjyClient, nickname: str, class_id: str,
             # 平台明确不接受的通道（本课已关闭 SWF 上报）：静默跳过，不进熔断计数
             continue
 
+        if status == "dispatched":
+            # 车道模式：派发即按序号报一行（完成顺序是乱的，逐格等打完就成乱序），
+            # 真实"被平台接受多少条"在车道回收时结算，一格也没被接受的会改判成失败并点名。
+            success_count += 1
+            consecutive_fails = 0
+            lane_ctx["sent"] += 1
+            log(f"[{nickname}] 刷进度 ✅ [{idx+1}/{len(leaf_cells)}] {cell_name}", "INFO")
+            _lane_reap()
+            time.sleep(MOOC_LANE_DISPATCH_GAP)
+            continue
+
         if status in ("ok", "noop"):
             success_count += 1
             consecutive_fails = 0
             if status == "noop":
                 log(f"[{nickname}] 刷进度 ⏭ [{idx+1}/{len(leaf_cells)}] {cell_name}（平台已记满，免发）", "INFO")
-            elif lane_ctx is None:
+            else:
                 log(f"[{nickname}] 刷进度 ✅ [{idx+1}/{len(leaf_cells)}] {cell_name}", "INFO")
         else:
             fail_count += 1
@@ -483,25 +561,57 @@ def _brush_progress(client: ZjyClient, nickname: str, class_id: str,
         else:
             time.sleep(0.02)
 
-    # ---- MOOC 车道回收：派发即计成功，最终以"平台真正接受的心跳条数"复核 ----
-    if lane_ctx is not None and lane_ctx["futs"]:
-        wait(list(lane_ctx["running"]))
-        _beat_ok = 0
-        _zero = 0
-        for _nm, _f in lane_ctx["futs"]:
-            try:
-                _n = _f.result() or 0
-            except Exception:
-                _n = 0
-            _beat_ok += _n
-            if _n == 0:
-                _zero += 1
-                log(f"[{nickname}] 刷进度 ❌ {_nm} 车道内全部心跳未被接受", "WARNING")
-        if _zero:
-            success_count = max(0, success_count - _zero)
-            fail_count += _zero
-        log(f"[{nickname}] 车道回收:{len(lane_ctx['futs'])} 个课件,被平台接受心跳 {_beat_ok} 条"
-            + (f",零接受 {_zero} 个" if _zero else ""), "INFO")
+    # ---- MOOC 车道收尾：等待期间继续逐格报进度，最后按"平台真正接受的条数"结算 ----
+    if lane_ctx is not None:
+        _waited = 0.0
+        while lane_ctx["futs"] and _waited < 3600:
+            _dn, _ = wait(list(lane_ctx["running"]), timeout=5.0, return_when=FIRST_COMPLETED)
+            lane_ctx["running"] -= _dn
+            _waited += 5.0
+            _lane_reap()
+        _lane_reap()
+        _zero = lane_ctx["zero"]
+        success_count = max(0, success_count - _zero)
+        fail_count += _zero
+        log(f"[{nickname}] 车道回收:{lane_ctx['done']}/{lane_ctx['sent']} 个课件已发完,"
+            f"被平台接受心跳 {lane_ctx['beats']} 条"
+            + (f",零接受 {_zero} 个(已改判失败)" if _zero else ""), "INFO")
+
+        # ---- 平台复核补满（仅 MOOC 车道）：实测"心跳全 200 却停在 speed=99 不入 completed"，
+        # 唯一权威口径是平台的已完成集合；位置语义=平台取历史最大值，整段重灌不会掉档。
+        _api = lane_ctx["api"]
+        if _api:
+            for _rd in (1, 2):
+                _comp = client.mooc_completed_cells(course_info_id, course_id)
+                if _comp is None:
+                    log(f"[{nickname}] ⚠️ 复核读不到平台已完成集合，跳过补满（以平台页面为准）", "WARNING")
+                    break
+                _miss = [cl for cl in leaf_cells if str(cl.get("id")) not in _comp]
+                if not _miss:
+                    break
+                log(f"[{nickname}] 复核第 {_rd} 轮：平台判定未学完 {len(_miss)} 个，补满中...", "WARNING")
+                _rf = []
+                for _cl in _miss:
+                    _ct = (_cl.get("fileType") or "").lower()
+                    _img = _mooc_is_img(_ct)
+                    _tg = _mooc_target_seconds(_cl, None, _ct)
+                    _rf.append(_LANE_POOL.submit(
+                        _mooc_beat_stream, client,
+                        _mooc_payloads(_mooc_base_record(_cl, course_id, course_info_id,
+                                                         client.stu_id, class_id, _tg, _img),
+                                       _tg, _img), *_api))
+                wait(_rf)
+            _comp = client.mooc_completed_cells(course_info_id, course_id)
+            if _comp is not None:
+                _still = [cl for cl in leaf_cells if str(cl.get("id")) not in _comp]
+                _mins = client.mooc_total_study_minutes(course_info_id, course_id)
+                log(f"[{nickname}] 平台复核：本次课件已学完 {len(leaf_cells) - len(_still)}"
+                    f"/{len(leaf_cells)} 个"
+                    + (f" · 全课学习时长 {_mins:.1f} 分" if _mins is not None else ""), "INFO")
+                for _cl in _still[:20]:
+                    log(f"[{nickname}] ⚠️ 复核后仍未学完：{str(_cl.get('name'))[:20]}", "WARNING")
+                if len(_still) > 20:
+                    log(f"[{nickname}] ⚠️ 另有 {len(_still) - 20} 个未学完（明细略）", "WARNING")
 
     log(f"[{nickname}] 🎉 进度秒刷结束:成功 {success_count} 个,失败 {fail_count} 个", "INFO")
 
@@ -589,6 +699,10 @@ def _parse_mp4_durations_parallel(client: ZjyClient, nickname: str, leaf_cells: 
         _file_url_raw = _cell.get("fileUrl")
         if skip_speed_full and _zyk_cell_speed(_cell) >= 100:
             continue
+        # MOOC 真实时长档：平台树里的 videoTime 就是最终申报值，解析值没有任何消费者，
+        # 不必为它花 ≥1 次外部请求 + ≥128KB 出口流量（非 faststart 视频最坏 +2MB）。
+        if ctype == "MOOC" and _mooc_video_time(_cell) > 0:
+            continue
         if _cell_type in VIDEO_TYPES and _file_url_raw:
             mp4_parse_tasks.append((_idx, _cell))
 
@@ -629,12 +743,17 @@ def _calculate_total_time(client: ZjyClient, nickname: str, cell: dict, idx: int
                            class_id: str, course_info_id: str, course_id: str,
                            ctype: str, cell_type: str, file_url_raw, mp4_cache: dict,
                            zyk_cache: Optional[dict] = None,
-                           zyk_stat: Optional[dict] = None) -> int:
+                           zyk_stat: Optional[dict] = None) -> float:
     """计算课件的目标学习时长(秒)。
 
     优化:不再对每个课件串行查询 spoc/studyRecord/list(385个课件=385次HTTP请求,极慢)。
     改为优先用 MP4 时长和 studentStudyRecord,仅在都失败时才惰性查询 studyRecord/list。
+
+    MOOC 走"真实时长档"提前返回：申报值直接取平台树的 videoTime，读不到才用解析值/按类型定值。
     """
+    if ctype == "MOOC":
+        return _mooc_target_seconds(cell, mp4_cache.get(idx), (cell.get("fileType") or "").lower())
+
     total_time = None
     spoc_record_time = None
     if zyk_cache is None:
@@ -731,9 +850,6 @@ def _calculate_total_time(client: ZjyClient, nickname: str, cell: dict, idx: int
     # 最短时长约束
     if total_time < 60 and cell_type not in IMAGE_TYPES:
         total_time = random.randint(60, 180)
-    # MOOC 最短 1200 秒(20分钟)
-    if ctype == "MOOC" and total_time < 1200 and cell_type not in IMAGE_TYPES:
-        total_time = random.randint(1200, 2400)
     # 图片类型确保有合理浏览时长
     if cell_type in IMAGE_TYPES and total_time < 30:
         total_time = random.randint(30, 60)
@@ -768,6 +884,8 @@ def _submit_heartbeat(client: ZjyClient, nickname: str, cell: dict, idx: int, to
     if ctype == "MOOC":
         ok = _submit_mooc_heartbeat(client, nickname, cell, idx, total, class_id, course_info_id,
                                     course_id, cell_type, total_time, simulate_real, lane_ctx)
+        if ok == "dispatched":
+            return "dispatched"
         return "ok" if ok else "fail"
     elif ctype == "RESOURCE":
         return _submit_resource_heartbeat(client, nickname, cell, course_info_id,
@@ -786,11 +904,14 @@ def _submit_heartbeat(client: ZjyClient, nickname: str, cell: dict, idx: int, to
 
 def _submit_mooc_heartbeat(client: ZjyClient, nickname: str, cell: dict, idx: int, total: int,
                             class_id: str, course_info_id: str, course_id: str,
-                            cell_type: str, total_time: int, simulate_real: bool,
-                            lane_ctx: Optional[dict] = None) -> bool:
-    """MOOC 心跳提交:6个API探测 → 车道串行流/并发提交/模拟真实。"""
+                            cell_type: str, total_time: float, simulate_real: bool,
+                            lane_ctx: Optional[dict] = None):
+    """MOOC 心跳提交:6个API探测 → 车道串行流/并发提交/模拟真实。
+
+    车道模式下返回 `"dispatched"`（成败与"平台接受条数"改由主循环收割时判定），其余返回 bool。
+    """
     cell_id = cell.get("id")
-    is_image = cell_type in IMAGE_TYPES
+    is_image = _mooc_is_img(cell_type)
 
     if is_image:
         _img_count = 1
@@ -810,9 +931,11 @@ def _submit_mooc_heartbeat(client: ZjyClient, nickname: str, cell: dict, idx: in
     if class_id:
         mooc_record["classId"] = class_id
 
-    # 心跳次数 = total_time // 5(每5秒一次),最多600次
+    # 心跳次数：模拟真实模式仍按"每 5 秒一条、最多 600 条"逐条真发；
+    # 快速模式的位置流条数由申报值决定（见 _mooc_payloads，不设 600 封顶——
+    # 真实时长档下长视频必须发满才到 100%，而封顶会让它停在 99%）
     heartbeat_interval = 5
-    heartbeat_count = min(total_time // heartbeat_interval, 600)
+    heartbeat_count = min(int(total_time) // heartbeat_interval, 600)
     if is_image:
         heartbeat_count = min(heartbeat_count, 5)
 
@@ -845,7 +968,7 @@ def _submit_mooc_heartbeat(client: ZjyClient, nickname: str, cell: dict, idx: in
         return _mooc_simulate_real(client, mooc_record, heartbeat_count, total_time,
                                     heartbeat_interval, is_image, method, api_path, use_ai)
 
-    payloads = _mooc_payloads(mooc_record, heartbeat_count, total_time, is_image)
+    payloads = _mooc_payloads(mooc_record, total_time, is_image)
     if lane_ctx is not None:
         # 车道模式：本格整条心跳流派给一条车道**串行**发送，主循环立刻派发下一格。
         # 心跳的位置语义是"递增才记"，同一课件内部乱序并发有少记风险；课件之间彼此独立，
@@ -856,24 +979,58 @@ def _submit_mooc_heartbeat(client: ZjyClient, nickname: str, cell: dict, idx: in
             if not _dn:
                 break            # 干等 2 秒无进展：不再阻塞派发，交给池自己的队列
         _fut = _LANE_POOL.submit(_mooc_beat_stream, client, payloads, method, api_path, use_ai)
-        lane_ctx["futs"].append((f"[{idx+1}/{total}] {cell.get('name','?')}", _fut))
+        if lane_ctx["api"] is None:
+            # 首个探测到的端点记给"平台复核补满"复用，省掉补满时每格一次探测
+            lane_ctx["api"] = (method, api_path, use_ai)
+        lane_ctx["futs"].append((f"[{idx+1}/{total}] {cell.get('name','?')}"[:48], _fut))
         lane_ctx["running"].add(_fut)
-        return True
+        return "dispatched"
     return _mooc_fast_concurrent(client, payloads, method, api_path, use_ai)
 
 
-def _mooc_payloads(mooc_record: dict, heartbeat_count: int, total_time: int, is_image: bool) -> list:
-    """生成 MOOC 快速模式的心跳体列表：条数=凑够目标时长，位置一次报到 total_time。"""
-    payloads = []
-    _progress_num = 1 if is_image else total_time
-    for _ in range(max(0, int(heartbeat_count))):
+def _mooc_payloads(mooc_record: dict, total_time, is_image: bool) -> list:
+    """MOOC 快速模式的心跳流：位置从 0 每 5 秒一跳递增，**末条精确等于申报值**。
+
+    两条实测硬要求：
+    1) 完成度 = 末条 actualNum ÷ 申报 totalNum，而 videoTime 常带小数（实测 1655.37），
+       等步长累加的浮点误差会停在 99%（实测 380 条全 200 仍判未完成）；
+    2) 图片类沿用被长期验证的 totalNum=actualNum=1 计数形，只由条数控制时长。
+    """
+    tgt = float(total_time)
+    out = []
+    if is_image:
+        for _ in range(max(1, int(tgt // MOOC_BEAT_STEP))):
+            hb = dict(mooc_record)
+            hb["id"] = str(uuid.uuid4()).upper()
+            hb["studyDuration"] = MOOC_BEAT_STEP
+            out.append(hb)
+        return out
+    pos = 0.0
+    while pos < tgt:
+        pos = min(pos + MOOC_BEAT_STEP, tgt)
+        if pos >= tgt:
+            pos = tgt                      # 消除浮点累加误差，保证末条精确到位
         hb = dict(mooc_record)
         hb["id"] = str(uuid.uuid4()).upper()
-        hb["studyDuration"] = total_time
-        hb["actualNum"] = _progress_num
-        hb["lastNum"] = _progress_num
-        payloads.append(hb)
-    return payloads
+        hb["studyDuration"] = MOOC_BEAT_STEP
+        hb["actualNum"] = pos
+        hb["lastNum"] = pos
+        hb["totalNum"] = tgt
+        out.append(hb)
+    return out
+
+
+def _mooc_base_record(cell: dict, course_id: str, course_info_id: str, stu_id: str,
+                      class_id: str, target, is_image: bool) -> dict:
+    """平台复核补满用的基准心跳体（字段集与主路径 mooc_record 一致）。"""
+    n = 1 if is_image else float(target)
+    rec = {"actualNum": n, "courseId": course_id, "courseInfoId": course_info_id,
+           "id": str(uuid.uuid4()).upper(), "lastNum": n, "params": {},
+           "resourceTotalNum": n, "sourceId": cell.get("id"), "speed": 100.0,
+           "studentId": stu_id, "studyDuration": float(target), "totalNum": n}
+    if class_id:
+        rec["classId"] = class_id
+    return rec
 
 
 def _mooc_send(client: ZjyClient, p: dict, method: str, api_path: str, use_ai: bool):

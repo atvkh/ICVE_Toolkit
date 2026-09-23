@@ -248,6 +248,44 @@ class ZjyClient:
             log(f"refresh_token_from_sso 异常: {e}", "ERROR")
             return False
 
+    def mooc_completed_cells(self, course_info_id, course_id):
+        """平台口径的"已学完"课件 id 集合（=页面 N/M 的 N）；读不到返回 None（区别于空集）。"""
+        try:
+            data = self.api_get_ai("course/studyRecord/completed/courseware", {
+                "courseInfoId": course_info_id, "courseId": course_id})
+        except Exception:
+            return None
+        if not isinstance(data, dict) or data.get("code") != 200:
+            return None
+        rows = data.get("data")
+        return {str(x) for x in rows} if isinstance(rows, list) else set()
+
+    def mooc_total_study_minutes(self, course_info_id, course_id):
+        """全课累计学习时长（分钟）。
+
+        读口 `getCellStudyList` 忽略分页且同一课件可能多行，故按 sourceId 取最大值再求和；
+        读不到返回 None。
+        """
+        try:
+            data = self.api_get_ai("course/studyRecord/getCellStudyList", {
+                "pageNum": "1", "pageSize": "300",
+                "courseInfoId": course_info_id, "courseId": course_id})
+        except Exception:
+            return None
+        rows = (data or {}).get("rows") if isinstance(data, dict) else None
+        if not isinstance(rows, list):
+            return None
+        best = {}
+        for r in rows:
+            if not isinstance(r, dict):
+                continue
+            try:
+                best[str(r.get("sourceId"))] = max(best.get(str(r.get("sourceId")), 0.0),
+                                                   float(r.get("studyDurations") or 0))
+            except (TypeError, ValueError):
+                continue
+        return sum(best.values()) / 60.0
+
     def auth_ai_domain(self) -> bool:
         """AI 域鉴权:用 sso_token(优先)或 token 换 ai_token。
 
