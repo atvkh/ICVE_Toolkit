@@ -10,21 +10,35 @@ import json
 import os
 import re
 import struct
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Optional, Union
 from urllib.parse import quote
 
 import requests
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad
+from requests.adapters import HTTPAdapter
 
 from utils import log
+
+# 连接池上限：requests 默认只缓存 10 条连接，刷课车道数一超过 10 就开始
+# "建连→用完即弃"，每条请求重付一次 TLS 握手（实测单条 RTT 从 ~0.07s 涨到 ~0.20s，
+# 12 车道反而比旧的格内并发更慢）。故显式放大到能容纳车道并发的量级。
+POOL_CONNECTIONS = 10
+POOL_MAXSIZE = 24
 
 # ==================== 域名常量 ====================
 BASE_URL = "https://zjy2.icve.com.cn/prod-api"        # 主域(SPOC/MOOC 课程)
 AI_BASE_URL = "https://ai.icve.com.cn/prod-api"        # AI 域(MOOC 课程设计/讨论)
 ZYK_BASE_URL = "https://zyk.icve.com.cn/prod-api"      # 资源库域
 SSO_BASE = "https://sso.icve.com.cn"                   # SSO 单点登录域
+
+# AI 域换票锁:passLogin 一次一张票,并发线程各自换票会把票数放大成"风暴"
+# (实测并发 3/8/16 → passLogin 3/8/16 次,扫描起头白等 0.75/2.0/4.0s),
+# 故冷会话补鉴权走 ensure_ai_token 的双检锁。
+_AI_AUTH_LOCK = threading.Lock()
 
 # 视频防盗链 Referer(反编译确认官方 H5 带此 header)
 _VIDEO_REFERER = {"Referer": "https://zjy2.icve.com.cn/prod-api/"}
@@ -140,6 +154,9 @@ class ZjyClient:
     def __init__(self, token: Optional[str] = None, sso_token: Optional[str] = None,
                  question_bank_dir: Optional[str] = None, accounts: Optional[dict] = None):
         self.session = requests.Session()
+        _adapter = HTTPAdapter(pool_connections=POOL_CONNECTIONS, pool_maxsize=POOL_MAXSIZE)
+        self.session.mount("https://", _adapter)
+        self.session.mount("http://", _adapter)
         self.session.headers.update({
             "User-Agent": "Mozilla/5.0 (Linux; Android 15; Pixel 8) AppleWebKit/537.36",
             "log-equipment-app-version": "2.5.6",
@@ -363,13 +380,25 @@ class ZjyClient:
 
     # ==================== AI 域 API(401 自动重新鉴权) ====================
 
+    def ensure_ai_token(self) -> bool:
+        """无票时补一次 AI 域鉴权;并发下只让第一个线程真打 passLogin,其余复用已换到的票。
+
+        只作用于"起手无票"这一种情况;401 懒重鉴权路径保持原样(不在此复用他人新票)。
+        """
+        if self.ai_token:
+            return True
+        with _AI_AUTH_LOCK:
+            if self.ai_token:
+                return True
+            return self.auth_ai_domain()
+
     def _ai_headers(self) -> dict:
         """AI 域请求头;token 缺失(登录后未鉴权)时先补一次 AI 域鉴权。
 
         apply_token 不再主动鉴权 AI 域,故冷会话的第一次 AI 调用在这里补齐。
         """
         if not self.ai_token:
-            self.auth_ai_domain()
+            self.ensure_ai_token()
         return {"Authorization": f"Bearer {self.ai_token}"} if self.ai_token else {}
 
     def api_get_ai(self, path: str, params: Optional[dict] = None, timeout: int = 10) -> Optional[dict]:
@@ -663,10 +692,24 @@ class ZjyClient:
         url = inner.get("fileUrl") if isinstance(inner, dict) else ""
         return url if str(url or "").startswith("http") else ""
 
-    def zyk_get_course_tree(self, course_info_id: str) -> list:
+    def _zyk_children(self, node: dict, depth: int, course_info_id: str):
+        """资源库树单层子节点:GET teacher/courseContent/studyList。非空列表才返回。"""
+        children = self.api_get_zyk("teacher/courseContent/studyList", {
+            "level": depth + 1,
+            "parentId": node.get("id"),
+            "courseInfoId": course_info_id,
+        })
+        return children if isinstance(children, list) and children else None
+
+    def zyk_get_course_tree(self, course_info_id: str, leaf_workers: Optional[int] = None) -> list:
         """资源库课程树:先拉 studyMoudleList 取模块,再递归 studyList 取子节点。
 
         返回扁平化的叶子节点列表。
+
+        `leaf_workers>=2` 时改走"按层并发"的 BFS:下一层的节点 id 来自上一层响应,
+        层与层之间的数据依赖锁死必须串行,但**同一层的父节点之间可以并发**——
+        实测一门 1004 叶的课要 1191 次请求,串行 DFS 104.8 秒,16 路按层并发压到个位数秒。
+        默认 None = 原串行递归(逐字不变),调用方按课程类型自行决定是否放宽。
         """
         if not self.zyk_token and not self.auth_zyk_domain():
             return []
@@ -677,41 +720,69 @@ class ZjyClient:
             if not isinstance(modules, list):
                 modules = []
 
+            # 中间层 fileType="子节点" 不是叶子,必须继续递归到最深层
             def _recurse(nodes, depth=0):
                 if depth > 10:  # 防止无限递归
                     return
                 for node in nodes or []:
                     node["_depth"] = depth
-                    children = self.api_get_zyk("teacher/courseContent/studyList", {
-                        "level": depth + 1,
-                        "parentId": node.get("id"),
-                        "courseInfoId": course_info_id,
-                    })
-                    if isinstance(children, list) and children:
+                    children = self._zyk_children(node, depth, course_info_id)
+                    if children:
                         node["children"] = children
                         _recurse(children, depth + 1)
                     else:
                         leaves.append(node)
 
-            _recurse(modules)
+            if not leaf_workers or leaf_workers < 2:
+                _recurse(modules)
+                return leaves
+
+            frontier = [(m, 0) for m in (modules or [])]
+            while frontier:
+                with ThreadPoolExecutor(max_workers=min(int(leaf_workers), len(frontier))) as _ex:
+                    probed = list(_ex.map(
+                        lambda it: (it[0], it[1], self._zyk_children(it[0], it[1], course_info_id)),
+                        frontier))
+                nxt = []
+                for node, depth, children in probed:
+                    node["_depth"] = depth
+                    if children and depth <= 10:
+                        node["children"] = children
+                        nxt.extend([(ch, depth + 1) for ch in children])
+                    else:
+                        leaves.append(node)
+                frontier = nxt
         except Exception as e:
             log(f"zyk_get_course_tree 异常: {e}", "ERROR")
         return leaves
 
     def get_course_cells(self, course_info_id: str, class_id: str, course_id: str,
-                          include_completed: bool = False, ctype: str = "SPOC") -> list:
+                          include_completed: bool = False, ctype: str = "SPOC",
+                          leaf_workers: Optional[int] = None) -> list:
         """获取课程的叶子节点(可刷课的课件单元)。
 
         :param include_completed: True 包含已完成的(speed>=100)
+        :param leaf_workers: 资源库树扫描的按层并发度(仅 RESOURCE 生效,None=原串行)
         :return: 叶子节点列表,每个含 id/name/fileType/fileUrl/_speed 等字段
         """
         # 资源库域:直接用 zyk_get_course_tree 返回的叶子节点
         if ctype == "RESOURCE":
-            leaves = self.zyk_get_course_tree(course_info_id)
+            leaves = self.zyk_get_course_tree(course_info_id, leaf_workers=leaf_workers)
             leaf_cells = [l for l in leaves if (l.get("fileType") or "") not in ["作业", "考试", "测验", "exam", "homework"]]
+            # 已刷过的资源库课,叶子上带 studentStudyRecord(含 speed/actualNum/totalNum)。
+            # 早先这里无条件写 _speed=0,等于告诉调用方"全课都没刷过",于是每点一次刷课
+            # 就把全课几千格重打一遍;现按平台口径回填,读不到时仍是 0(只多刷不漏刷)。
             for l in leaf_cells:
-                l["_speed"] = 0
+                _ssr = l.get("studentStudyRecord")
+                _sp = _ssr.get("speed") if isinstance(_ssr, dict) else None
+                try:
+                    l["_speed"] = float(_sp) if _sp is not None else 0
+                except (TypeError, ValueError):
+                    l["_speed"] = 0
                 l.setdefault("fileUrl", "")
+            # RESOURCE 分支提前 return,走不到下面通用的"已完成"过滤，必须在此自己过
+            if not include_completed:
+                leaf_cells = [l for l in leaf_cells if l.get("_speed", 0) < 100]
             log(f"[扫描-RESOURCE] 资源库叶子节点={len(leaf_cells)} (已过滤作业/考试/测验)", "INFO")
             return leaf_cells
 
