@@ -128,12 +128,6 @@ def menu_speed():
         return
     course = courses[idx - 1]
 
-    print("\n  模式选择:", flush=True)
-    print("  [1] 快速模式(并发提交,效率优先)", flush=True)
-    print("  [2] 模拟真实(随机间隔,降低风险)", flush=True)
-    mode = input_choice("选择", ["1", "2"])
-    simulate = (mode == "2")
-
     print("\n  范围选择:", flush=True)
     print("  [1] 全部(进度+答题+讨论)", flush=True)
     print("  [2] 仅进度", flush=True)
@@ -144,7 +138,7 @@ def menu_speed():
 
     log(f"开始刷课: {course.get('courseName', '?')}", "INFO")
     try:
-        run_speed_course(current_client, course, speed_type, simulate)
+        run_speed_course(current_client, course, speed_type)
     except Exception as e:
         log(f"刷课异常: {e}", "ERROR")
 

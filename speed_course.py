@@ -1,8 +1,6 @@
 """刷课模块:SPOC / MOOC / 资源库三类课程刷课 + 自动答题 + 讨论自动回复。
 
-支持两种模式:
-- 快速模式:并发提交心跳包,效率最优
-- 模拟真实模式:逐条发送,随机间隔,降低被检测风险
+刷课固定走快速模式(并发/车道提交心跳，效率最优)。
 
 刷课范围:
 - all:进度 + 答题 + 讨论
@@ -208,14 +206,12 @@ def _zyk_incr_pairs(actual, total: int, step: float = ZYK_BEAT_STEP) -> list:
     return out
 
 
-def run_speed_course(client: ZjyClient, course: dict, speed_type: str = "all",
-                     simulate_real: bool = False) -> None:
+def run_speed_course(client: ZjyClient, course: dict, speed_type: str = "all") -> None:
     """一键自动刷课。
 
     :param client: ZjyClient 实例
     :param course: 课程 dict,需含 classId/courseInfoId/courseId/_courseType/courseName
     :param speed_type: "all" | "progress" | "exam" | "discussion"
-    :param simulate_real: True=模拟真实(逐条间隔),False=快速并发
 
     MOOC 重叠流水线(2026-09-14 生产移植):任务开头先把全部未交卷"点开"起表
     (205 时间闸门只认 wall-clock,起表后刷课件/讨论的耗时天然攒够答题时间)→
@@ -250,7 +246,7 @@ def run_speed_course(client: ZjyClient, course: dict, speed_type: str = "all",
 
         # Part 1: 刷进度
         if speed_type in ["all", "progress"]:
-            _brush_progress(client, nickname, class_id, course_info_id, course_id, ctype, simulate_real)
+            _brush_progress(client, nickname, class_id, course_info_id, course_id, ctype)
 
         # Part 1.5: 自动答题(MOOC 走成熟度分流+并发提交;SPOC/RESOURCE 原顺序模式)
         if speed_type in ["all", "exam"]:
@@ -352,8 +348,7 @@ def _mooc_submit_batch(client: ZjyClient, nickname: str, class_id: str,
 # ==================== Part 1: 刷进度 ====================
 
 def _brush_progress(client: ZjyClient, nickname: str, class_id: str,
-                     course_info_id: str, course_id: str, ctype: str,
-                     simulate_real: bool) -> None:
+                     course_info_id: str, course_id: str, ctype: str) -> None:
     """刷课件进度:SPOC/MOOC/资源库三分支。"""
     log(f"[{nickname}] 🚀 开始秒刷课件进度...", "INFO")
 
@@ -433,22 +428,20 @@ def _brush_progress(client: ZjyClient, nickname: str, class_id: str,
     log(f"[{nickname}] 找到 {len(leaf_cells)} 个课件，开始提交心跳...", "INFO")
     aes_key = client.generate_aes_key() if ctype not in ("MOOC", "RESOURCE") else None
 
-    # 快速模式下并行解析 MP4 时长
+    # 并行解析 MP4 时长（真实时长档会跳过有 videoTime 的格）
     # 资源库相对短链即时解析:同轮按 cellId 去重缓存,失败同样缓存以免重试打点
     zyk_url_cache = {}
     zyk_resolve_stat = {"ok": 0, "fail": 0}
-    mp4_duration_cache = {}
-    if not simulate_real:
-        mp4_duration_cache = _parse_mp4_durations_parallel(
-            client, nickname, leaf_cells, ctype, zyk_url_cache, zyk_resolve_stat,
-            workers=RESOURCE_PARSE_WORKERS if ctype == "RESOURCE" else 4,
-            # 平台已记满的资源库格下面直接免发，解析结果用不上 —— 不为之花一次 RTT
-            skip_speed_full=ctype == "RESOURCE")
+    mp4_duration_cache = _parse_mp4_durations_parallel(
+        client, nickname, leaf_cells, ctype, zyk_url_cache, zyk_resolve_stat,
+        workers=RESOURCE_PARSE_WORKERS if ctype == "RESOURCE" else 4,
+        # 平台已记满的资源库格下面直接免发，解析结果用不上 —— 不为之花一次 RTT
+        skip_speed_full=ctype == "RESOURCE")
 
     # MOOC 跨课件车道:每格整条心跳流派给一条车道串行发送，主循环立刻派发下一格。
-    # 只有 MOOC 快速模式进入本块；SPOC/RESOURCE/模拟真实模式 lane_ctx 恒 None（红线）。
+    # 只有 MOOC 进入本块；SPOC/RESOURCE 的 lane_ctx 恒 None（红线）
     lane_ctx = None
-    if ctype == "MOOC" and not simulate_real and MOOC_LANES > 1:
+    if ctype == "MOOC" and MOOC_LANES > 1:
         lane_ctx = {"running": set(), "futs": [], "api": None, "done": 0, "beats": 0, "zero": 0,
                     "sent": 0, "t0": time.time(), "t_note": 0.0}
 
@@ -515,7 +508,7 @@ def _brush_progress(client: ZjyClient, nickname: str, class_id: str,
 
         # 提交心跳
         status = _submit_heartbeat(client, nickname, cell, idx, len(leaf_cells), class_id, course_info_id,
-                                   course_id, ctype, cell_type, total_time, aes_key, simulate_real,
+                                   course_id, ctype, cell_type, total_time, aes_key,
                                    lane_ctx, zyk_swf_stat, zyk_noop_stat, zyk_task_stat)
 
         if status == "skip":
@@ -554,10 +547,8 @@ def _brush_progress(client: ZjyClient, nickname: str, class_id: str,
         # SPOC/RESOURCE 间隔维持原值不变。
         if lane_ctx is not None:
             time.sleep(MOOC_LANE_DISPATCH_GAP)
-        elif ctype == "MOOC" and not simulate_real:
+        elif ctype == "MOOC":
             time.sleep(1.5)
-        elif simulate_real:
-            time.sleep(0.1)
         else:
             time.sleep(0.02)
 
@@ -632,7 +623,7 @@ def _brush_progress(client: ZjyClient, nickname: str, class_id: str,
         log(f"[{nickname}] RESOURCE SWF 纳管:计数形心跳成功 {zyk_swf_stat['ok']} 个{_dt}", "INFO")
 
     # ---- 资源库平台复核：拿平台自己的读数说话，不拿"HTTP 200 的条数"当完成 ----
-    if ctype == "RESOURCE" and not simulate_real and leaf_cells:
+    if ctype == "RESOURCE" and leaf_cells:
         _rv = client.zyk_get_course_tree(course_info_id, leaf_workers=RESOURCE_SCAN_WORKERS)
         _sp_map = {}
         for _l in _rv or []:
@@ -871,7 +862,7 @@ def _random_duration(cell_type: str) -> int:
 def _submit_heartbeat(client: ZjyClient, nickname: str, cell: dict, idx: int, total: int,
                       class_id: str, course_info_id: str, course_id: str,
                       ctype: str, cell_type: str, total_time: int,
-                      aes_key: Optional[str], simulate_real: bool,
+                      aes_key: Optional[str],
                       lane_ctx: Optional[dict] = None,
                       zyk_swf_stat: Optional[dict] = None,
                       zyk_noop_stat: Optional[dict] = None,
@@ -883,7 +874,7 @@ def _submit_heartbeat(client: ZjyClient, nickname: str, cell: dict, idx: int, to
     """
     if ctype == "MOOC":
         ok = _submit_mooc_heartbeat(client, nickname, cell, idx, total, class_id, course_info_id,
-                                    course_id, cell_type, total_time, simulate_real, lane_ctx)
+                                    course_id, cell_type, total_time, lane_ctx)
         if ok == "dispatched":
             return "dispatched"
         return "ok" if ok else "fail"
@@ -898,15 +889,15 @@ def _submit_heartbeat(client: ZjyClient, nickname: str, cell: dict, idx: int, to
                                           {"ok": 0, "noop": 0, "skipped": 0, "disabled": False})
     else:
         ok = _submit_spoc_heartbeat(client, nickname, cell, class_id, course_info_id,
-                                    course_id, cell_type, total_time, aes_key, simulate_real)
+                                    course_id, cell_type, total_time, aes_key)
         return "ok" if ok else "fail"
 
 
 def _submit_mooc_heartbeat(client: ZjyClient, nickname: str, cell: dict, idx: int, total: int,
                             class_id: str, course_info_id: str, course_id: str,
-                            cell_type: str, total_time: float, simulate_real: bool,
+                            cell_type: str, total_time: float,
                             lane_ctx: Optional[dict] = None):
-    """MOOC 心跳提交:6个API探测 → 车道串行流/并发提交/模拟真实。
+    """MOOC 心跳提交:6个API探测 → 车道串行流 / 单课件内并发回退。
 
     车道模式下返回 `"dispatched"`（成败与"平台接受条数"改由主循环收割时判定），其余返回 bool。
     """
@@ -931,13 +922,9 @@ def _submit_mooc_heartbeat(client: ZjyClient, nickname: str, cell: dict, idx: in
     if class_id:
         mooc_record["classId"] = class_id
 
-    # 心跳次数：模拟真实模式仍按"每 5 秒一条、最多 600 条"逐条真发；
-    # 快速模式的位置流条数由申报值决定（见 _mooc_payloads，不设 600 封顶——
-    # 真实时长档下长视频必须发满才到 100%，而封顶会让它停在 99%）
+    # 条数由申报值决定（见 _mooc_payloads）：时长 = 5 秒 × 被接受条数，
+    # 且不设旧口径的 600 条封顶——真实时长档下长视频必须发满才到 100%
     heartbeat_interval = 5
-    heartbeat_count = min(int(total_time) // heartbeat_interval, 600)
-    if is_image:
-        heartbeat_count = min(heartbeat_count, 5)
 
     # 探测可用 API(全灭→冷却 15s+重认证 AI 域后二轮探测;仍败才计失败——
     # 实测限流为瞬时抖动,冷却后大概率恢复;原单轮即弃使一次抖动废掉整个课件)
@@ -963,10 +950,6 @@ def _submit_mooc_heartbeat(client: ZjyClient, nickname: str, cell: dict, idx: in
         return False
 
     method, api_path, use_ai = working_api
-
-    if simulate_real:
-        return _mooc_simulate_real(client, mooc_record, heartbeat_count, total_time,
-                                    heartbeat_interval, is_image, method, api_path, use_ai)
 
     payloads = _mooc_payloads(mooc_record, total_time, is_image)
     if lane_ctx is not None:
@@ -1103,45 +1086,6 @@ def _mooc_probe_refusal(probe_last: dict) -> str:
     return ""
 
 
-def _mooc_simulate_real(client: ZjyClient, mooc_record: dict, heartbeat_count: int,
-                         total_time: int, heartbeat_interval: int, is_image: bool,
-                         method: str, api_path: str, use_ai: bool) -> bool:
-    """MOOC 模拟真实模式:逐条发送,间隔5-8秒。"""
-    ok_count = 0
-    for hb_idx in range(heartbeat_count):
-        hb_record = dict(mooc_record)
-        hb_record["id"] = str(uuid.uuid4()).upper()
-        _progress_num = 1 if is_image else total_time
-        if hb_idx == heartbeat_count - 1:
-            hb_record["studyDuration"] = total_time
-            hb_record["actualNum"] = _progress_num
-            hb_record["lastNum"] = _progress_num
-        else:
-            hb_record["studyDuration"] = (hb_idx + 1) * heartbeat_interval
-            _hb_progress = 1 if is_image else (hb_idx + 1) * heartbeat_interval
-            hb_record["actualNum"] = _hb_progress
-            hb_record["lastNum"] = _hb_progress
-        try:
-            if use_ai:
-                if method == "PUT":
-                    r = client.api_put_ai(api_path, hb_record)
-                else:
-                    r = client.api_post_ai(api_path, hb_record)
-            else:
-                if method == "PUT":
-                    r = client.api_put(api_path, hb_record)
-                else:
-                    r = client.api_post(api_path, hb_record)
-            if r and r.get("code") == 200:
-                ok_count += 1
-            else:
-                break
-        except Exception:
-            break
-        if hb_idx < heartbeat_count - 1:
-            time.sleep(random.uniform(5, 8))
-    return ok_count > 0
-
 
 def _mooc_fast_concurrent(client: ZjyClient, payloads: list,
                            method: str, api_path: str, use_ai: bool) -> bool:
@@ -1267,7 +1211,7 @@ def _submit_resource_heartbeat(client: ZjyClient, nickname: str, cell: dict,
 def _submit_spoc_heartbeat(client: ZjyClient, nickname: str, cell: dict,
                             class_id: str, course_info_id: str, course_id: str,
                             cell_type: str, total_time: int,
-                            aes_key: Optional[str], simulate_real: bool) -> bool:
+                            aes_key: Optional[str]) -> bool:
     """SPOC 心跳提交:AES-128-ECB 加密,服务器每次+5秒。"""
     if not aes_key:
         log(f"[{nickname}] SPOC 刷课失败: AES 密钥为空(token缺失)", "ERROR")
@@ -1294,58 +1238,9 @@ def _submit_spoc_heartbeat(client: ZjyClient, nickname: str, cell: dict,
             "studentId": client.stu_id, "studyTime": total_time, "totalNum": total_time,
         }
 
-    if simulate_real:
-        return _spoc_simulate_real(client, record_proto, hb_count, total_time,
-                                    is_image, aes_key)
-    else:
-        return _spoc_fast_concurrent(client, record_proto, hb_count, total_time,
-                                      is_image, aes_key, nickname)
+    return _spoc_fast_concurrent(client, record_proto, hb_count, total_time,
+                                  is_image, aes_key, nickname)
 
-
-def _spoc_simulate_real(client: ZjyClient, record_proto: dict, hb_count: int,
-                         total_time: int, is_image: bool, aes_key: str) -> bool:
-    """SPOC 模拟真实模式(2026-09-14 生产移植):服务端每条心跳固定 +5 秒、完全忽略
-    客户端 studyTime。共用的 hb_count=total_time 是给快速模式做并发限流补偿的,
-    串行沿用=5 倍超发(600 秒课件发 600 条×8-15s≈57 分钟,真实只要 10 分钟)。
-    故串行按 +5 秒机制独立计条数(达标下限 ceil(total/5) 加 20% 余量容忍偶发失败),
-    并把间隔压到 ≈5 秒,使"真实经过时间≈服务端累计时长"(≈1.2 倍速,真人看课正常形态)。
-    图片课件按计数达标,沿用共用条数。"""
-    if is_image:
-        _sim_hb_count = hb_count
-    else:
-        _sim_min = -(-total_time // 5)
-        _sim_hb_count = min(_sim_min + max(2, _sim_min // 5), 2000)
-    ok_count = 0
-    for hb_idx in range(_sim_hb_count):
-        hb = dict(record_proto)
-        hb["id"] = str(uuid.uuid4()).upper()
-        _progress_num = 1 if is_image else total_time
-        if hb_idx == _sim_hb_count - 1:
-            hb["studyTime"] = total_time
-        else:
-            # 单调递增且不得超过 total_time(末条补齐;旧实现中途冲到 10×total_time 反成异常曲线)
-            hb["studyTime"] = min(total_time, (hb_idx + 1) * 5)
-        hb["actualNum"] = _progress_num
-        hb["lastNum"] = _progress_num
-
-        json_str = json.dumps(hb, separators=(',', ':'), sort_keys=True)
-        encrypted = client.aes_encrypt(json_str, aes_key)
-        if not encrypted:
-            break
-        safe_enc = encrypted.replace('%', '%25').replace('+', '%2B')
-        try:
-            _r = client.session.post(f"{BASE_URL}/spoc/studyRecord",
-                                     json={"param": safe_enc}, timeout=15)
-            r = _r.json() if _r.status_code == 200 else None
-            if r and r.get("code") == 200:
-                ok_count += 1
-            else:
-                break
-        except Exception:
-            break
-        if hb_idx < _sim_hb_count - 1:
-            time.sleep(random.uniform(4.5, 6.5))
-    return ok_count > 0
 
 
 def _spoc_fast_concurrent(client: ZjyClient, record_proto: dict, hb_count: int,
