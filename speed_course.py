@@ -1283,7 +1283,8 @@ def _brush_exam(client: ZjyClient, nickname: str, class_id: str,
     - 资源库:zyk_get_homework_answers(直接抓取服务端标准答案)
     - SPOC/MOOC:find_classmate_answers(学生号直取/同学扫包) + 教师号预览 + 题库兜底
     """
-    from answer import get_course_exams_list, _is_low_score, do_auto_answer_single_exam
+    from answer import (get_course_exams_list, _is_low_score, do_auto_answer_single_exam,
+                         zyk_exam_window_closed)
 
     log(f"[{nickname}] 🚀 开始自动答题...", "INFO")
     try:
@@ -1297,6 +1298,7 @@ def _brush_exam(client: ZjyClient, nickname: str, class_id: str,
         log(f"[{nickname}] 发现 {len(unsubmitted_exams)} 个未提交的作业/考试,开始逐一答题...", "INFO")
         exam_success = 0
         exam_fail = 0
+        exam_window_skip = 0
         for exam in unsubmitted_exams:
             exam_id = exam.get("id") or exam.get("examId")
             title = exam.get("title", "未命名任务")
@@ -1307,10 +1309,14 @@ def _brush_exam(client: ZjyClient, nickname: str, class_id: str,
             )
             if ok:
                 exam_success += 1
+            elif ctype == "RESOURCE" and zyk_exam_window_closed(msg):
+                # 平台按作答窗口拒绝：不是链坏了，也不该记成失败（SPOC/MOOC 此计数恒 0，汇总串不变）
+                exam_window_skip += 1
             else:
                 exam_fail += 1
             time.sleep(1)
-        log(f"[{nickname}] 🎉 自动答题结束:成功 {exam_success} 个,失败 {exam_fail} 个", "INFO")
+        _ztail = f",窗口未开放/已结束跳过 {exam_window_skip} 个" if exam_window_skip else ""
+        log(f"[{nickname}] 🎉 自动答题结束:成功 {exam_success} 个,失败 {exam_fail} 个{_ztail}", "INFO")
     except Exception as e:
         log(f"[{nickname}] 自动答题环节异常: {e}", "ERROR")
 

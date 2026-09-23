@@ -43,6 +43,17 @@ def mooc_exam_window_closed(msg):
     return "非作答时间" in str(msg or "")
 
 
+def zyk_exam_window_closed(msg):
+    """资源库(zyk 域)作答窗口未开放/已结束的分流判据。
+
+    平台原文实测为 `{"msg":"不在作答时间内，不能作答！！！","code":400}`（作业截止在多年前的那批
+    永远命中它），与 MOOC 的「非作答时间禁止进入」同语义不同字面，故两个子串都认。
+    **仅 RESOURCE 分支使用**（不改 MOOC/SPOC 的判定与日志）。
+    """
+    m = str(msg or "")
+    return ("不在作答时间" in m) or ("非作答时间" in m)
+
+
 def mooc_stagger_open_exams(client, exams, nickname, jitter=0.5):
     """一次性点开全部未交卷(GET course/exam/paper 有副作用=创建 taskExamRecord,
     createTime 同批起表)。205 闸门只认 now−createTime wall-clock、与期间干什么无关,
@@ -170,6 +181,11 @@ def get_course_exams_list(client: ZjyClient, class_id: str, course_info_id: str,
 
 def _get_resource_exams(client: ZjyClient, course_info_id: str, course_id: str) -> list:
     """资源库域:调用 zyk_get_exam_list 获取作业/考试/测验列表。"""
+    if not client.zyk_token and not client.auth_zyk_domain():
+        # 换票失败时平台什么都给不出，不说清就会被当成"这门课没有作业"
+        log(f"[考试列表-资源库] 资源库域换票失败：{getattr(client, 'zyk_auth_msg', '') or '未知原因'}"
+            f" ⇒ 取不到作业/测验列表（这不是「没有作业」），请重新登录", "ERROR")
+        return []
     raw_exams = client.zyk_get_exam_list(course_info_id, course_id)
     result = []
     for e in raw_exams:
@@ -437,9 +453,15 @@ def _do_resource_answer(client: ZjyClient, nickname: str, exam_id: str,
         log(f"[{nickname}] ✅ {title}: {msg}", "SUCCESS")
         return True, msg
 
-    err_msg = result.get("msg", "提交失败") if result else "提交请求失败"
-    log(f"[{nickname}] ❌ {title}: {err_msg}", "WARNING")
-    return False, err_msg
+    # `zyk_submit_exam` 已把平台原始响应放在 fail_details 里，但只取 msg 就只剩"提交失败"四个字。
+    # 实测这一类失败绝大多数是平台按作答窗口拒绝（原文 `不在作答时间内，不能作答！！！` code=400），
+    # 属于"本来就不该交"，不是链坏了 ⇒ 把平台 code/msg 抬进日志与返回值，供上层分流。
+    _fd = result.get("fail_details") if isinstance(result, dict) else None
+    _fd = _fd if isinstance(_fd, dict) else {}
+    _pmsg = str(_fd.get("msg") or "").strip()
+    err_msg = _pmsg or (result.get("msg", "提交失败") if result else "提交请求失败")
+    log(f"[{nickname}] ❌ {title}: 资源库提交失败 code={_fd.get('code')} msg={err_msg[:80]}", "WARNING")
+    return False, f"资源库提交失败: {err_msg}"
 
 
 # ==================== SPOC / MOOC 答题 ====================
@@ -1336,6 +1358,7 @@ def run_auto_answer_all_task(client: ZjyClient, nickname: str, class_id: str,
         log(f"[{nickname}] 发现 {len(unsubmitted)} 个待答题任务,开始逐一答题...", "INFO")
         success = 0
         fail = 0
+        window_skip = 0
         for idx, exam in enumerate(unsubmitted, 1):
             exam_id = exam.get("id") or exam.get("examId")
             title = exam.get("title", "未命名任务")
@@ -1352,11 +1375,15 @@ def run_auto_answer_all_task(client: ZjyClient, nickname: str, class_id: str,
             )
             if ok:
                 success += 1
+            elif ctype == "RESOURCE" and zyk_exam_window_closed(msg):
+                # 平台按作答窗口拒绝（作业截止多年的那批），SPOC/MOOC 此计数恒 0 ⇒ 汇总串逐字不变
+                window_skip += 1
             else:
                 fail += 1
             # 任务间隔
             time.sleep(1)
 
-        log(f"[{nickname}] 🎉 批量答题结束:成功 {success} 个,失败 {fail} 个", "INFO")
+        _wtail = f",窗口未开放/已结束跳过 {window_skip} 个" if window_skip else ""
+        log(f"[{nickname}] 🎉 批量答题结束:成功 {success} 个,失败 {fail} 个{_wtail}", "INFO")
     except Exception as e:
         log(f"[{nickname}] 批量答题异常: {e}", "ERROR")
