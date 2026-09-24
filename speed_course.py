@@ -10,6 +10,7 @@
 """
 
 import json
+import math
 import random
 import time
 import uuid
@@ -87,6 +88,131 @@ def _mooc_target_seconds(cell: dict, parsed_media_sec=None, cell_type: str = "")
     if parsed_media_sec and parsed_media_sec > 0:
         return float(parsed_media_sec)
     return MOOC_IMG_SECONDS if _mooc_is_img(cell_type) else MOOC_DEFAULT_SECONDS
+
+
+# ==================== SPOC 刷课提速（真实时长档 + 跨课件车道；红线：只动 ctype=='SPOC'） ====================
+# 三条实测口径决定了这个形态（都在真号真课上量过，不是推断）：
+#   ① 时长 = 5 秒 × 被平台接受的心跳条数，与申报位置无关；
+#   ② **同一课件内部并发**会把时长入账打到 0.30~0.47（平台侧读-改-写被覆盖），跨课件并发不丢账
+#      ⇒ 只能"课件内严格串行 + 课件之间并行 K 条车道"，旧形态的格内 10 路并发是净损失；
+#   ③ 压缩包/other/其它 三类附件平台一律回 code=500「资源类型无法学习」，而这类失败会计入
+#      "连续 3 次失败即停止尝试"的熔断 ⇒ 不预先剔除，整门课会在第一个附件格之后被放弃。
+SPOC_V2 = True                 # False = 逐字退回旧形态（格内并发 + 随机时长），留作线上回退开关
+SPOC_LANES = 12                # 跨课件车道数（与 MOOC 同宽，在飞量由车道数天然封顶）
+SPOC_LANE_DISPATCH_GAP = 0.2   # 派发间隔（秒）：只防本地瞬时打满，不承担平台限速
+SPOC_BEAT_STEP = 5.0           # 与官方播放器一致的 5 秒一条
+SPOC_TIME_FACTOR = 2.0         # 申报时长 = 真实长度 × 该系数（1.0 = 与课件等长）
+SPOC_DOC_SECONDS = 120.0       # 文档/表格/未知类型的"真实长度"（官方 pptx 实测 111 秒量级）
+SPOC_IMG_BEATS = 5             # 图片类计数形心跳条数
+SPOC_PARSE_WORKERS = 12        # 视频时长解析并发度（串行 4 → 12 实测快 1.9~2.6 倍）
+SPOC_RECHECK_ROUNDS = 3        # 收尾复核轮数：实测"发完立刻读回"入账率只有 0.54（落库滞后）
+SPOC_RECHECK_WAIT = 6.0        # 每轮复核前的缓冲秒数，给平台留出库时间
+SPOC_REJECT_FILE_TYPES = ("压缩包", "other", "其它")
+
+# SPOC 车道池与 MOOC 池分开建：两类课不互相抢在飞额度
+_SPOC_LANE_POOL = ThreadPoolExecutor(max_workers=SPOC_LANES, thread_name_prefix="spoc-lane")
+
+
+def _spoc_kind_of(cell_type: str) -> str:
+    """心跳形态分类：图片走计数形，音视频按解析长度，其余按配置定值。
+
+    这里**刻意只认全局 IMAGE_TYPES**（不把 'img' 特例算进来）：'img' 在资源库里是计数型，
+    但在 SPOC 走申报制，两类混用会让同一门课两次刷出来的每格时长对不上。
+    """
+    if cell_type in IMAGE_TYPES:
+        return "img"
+    if cell_type in AUDIO_TYPES:
+        return "audio"
+    if cell_type in VIDEO_TYPES:
+        return "video"
+    return "doc"
+
+
+def _spoc_target_seconds(kind: str, parsed_sec=None) -> float:
+    """一格要申报的总长 T：条数 = ceil(T/5)、末条位置 = T ⇒ 时长与完成度同时到位。
+
+    平台侧不存在课件长度（树接口无长度字段、getStudyCellInfo 只是上次申报值的回声），
+    所以视频只能用自己解析出的媒体头时长；解析不出与文档类一律走配置定值，
+    **不再 random(600,1800)** —— 那个随机正是"39 分钟视频记成 1367 秒"的虚增源头。
+    """
+    if kind == "img":
+        return 1.0
+    base = float(parsed_sec) if parsed_sec and float(parsed_sec) > 0 else SPOC_DOC_SECONDS
+    return round(base * SPOC_TIME_FACTOR, 2)
+
+
+def _spoc_filter_reject(leaf_cells: list, nickname: str, where: str) -> list:
+    """剔掉"平台一律回 500"的附件类课件。跳过、不计失败、不触发熔断。"""
+    if not SPOC_V2:
+        return leaf_cells
+    keep = [c for c in leaf_cells if (c.get("fileType") or "") not in SPOC_REJECT_FILE_TYPES]
+    n = len(leaf_cells) - len(keep)
+    if n:
+        log(f"[{nickname}] 跳过 {n} 个平台不支持心跳的附件课件（{'、'.join(SPOC_REJECT_FILE_TYPES)}，"
+            f"必回 500；{where}）", "INFO")
+    return keep
+
+
+def _spoc_beat_payloads(client: ZjyClient, aes_key: str, class_id: str, course_info_id: str,
+                        cell_id: str, stu_id, target: float, step: float,
+                        is_image: bool, img_beats: int, start: float = 0.0):
+    """一格完整心跳流（与旧形态同字段、同 AES、同端点，只改条数与位置形状）。
+
+    start>0 用于收尾复核的差额补发：从平台已记秒数续推，不重发已到账的那一段。
+    """
+    recs = []
+    if is_image:
+        for _i in range(max(1, int(img_beats or 1))):
+            recs.append({"actualNum": 1, "classId": class_id, "courseInfoId": course_info_id,
+                         "id": str(uuid.uuid4()).upper(), "lastNum": 1, "params": {},
+                         "resourceTotalNum": 1, "sourceId": cell_id, "speed": 100.0,
+                         "studentId": stu_id, "studyTime": 1, "totalNum": 1})
+        return recs
+    total_num = float(target)
+    _from = max(0.0, float(start or 0))
+    step = max(1.0, float(step))
+    n = max(1, int(math.ceil(max(0.0, total_num - _from) / step)))
+    for i in range(n):
+        pos = total_num if i == n - 1 else min(total_num, _from + (i + 1) * step)
+        recs.append({"actualNum": pos, "classId": class_id, "courseInfoId": course_info_id,
+                     "id": str(uuid.uuid4()).upper(), "lastNum": pos, "params": {},
+                     "resourceTotalNum": total_num, "sourceId": cell_id, "speed": 100.0,
+                     "studentId": stu_id, "studyTime": total_num, "totalNum": total_num})
+    return recs
+
+
+def _spoc_encrypt(client: ZjyClient, aes_key: str, rec: dict):
+    """单条心跳加密成 POST body（与旧内联写法逐字同形：sort_keys + 紧凑分隔符 + %25/%2B 转义）"""
+    js = json.dumps(rec, separators=(',', ':'), sort_keys=True)
+    enc = client.aes_encrypt(js, aes_key)
+    if not enc:
+        return None
+    return {"param": enc.replace('%', '%25').replace('+', '%2B')}
+
+
+def _spoc_lane_stream(client: ZjyClient, bodies: list) -> int:
+    """一条车道 = 一个课件的完整心跳流，**严格串行**（同课件并发会丢时长账）。"""
+    ok = 0
+    for b in bodies:
+        try:
+            r = client.session.post(f"{BASE_URL}/spoc/studyRecord", json=b, timeout=15)
+            j = r.json() if r.status_code == 200 else None
+        except Exception:
+            j = None
+        if isinstance(j, dict) and j.get("code") == 200:
+            ok += 1
+    return ok
+
+
+def _spoc_cell_study(client: ZjyClient, class_id: str, cell_id: str):
+    """单格权威读回（getStudyCellInfo）。**不得**用 studyRecord/list 的 rows[0]——
+    实测同一格返回 55+ 行（每批心跳落一行），rows[0] 是任意一行。"""
+    d = client.api_get("spoc/courseDesign/getStudyCellInfo", {"id": cell_id, "classId": class_id})
+    ssr = ((d or {}).get("data") or {}).get("studentStudyRecord") or {}
+    try:
+        return float(ssr.get("studyTime") or 0), float(ssr.get("speed") or 0)
+    except (TypeError, ValueError):
+        return 0.0, 0.0
 
 
 # MOOC 车道池：模块级复用，线程只在提交时创建
@@ -389,6 +515,9 @@ def _brush_progress(client: ZjyClient, nickname: str, class_id: str,
         log(f"[{nickname}] "
             + (f"纳管 {_swf_n} 个 SWF 动画/测验/考试/讨论课件（计数形单次心跳）" if ctype == "RESOURCE"
                else f"跳过 {_swf_n} 个 SWF 动画课件(平台不支持心跳刷时长)"), "INFO")
+    # SPOC 必拒附件类预过滤（不计失败、不进熔断；MOOC/RESOURCE 逐字不变）
+    if ctype == "SPOC":
+        leaf_cells = _spoc_filter_reject(leaf_cells, nickname, "首轮扫描")
 
     # 全部已完成则重刷(加时长)
     if not leaf_cells:
@@ -402,6 +531,8 @@ def _brush_progress(client: ZjyClient, nickname: str, class_id: str,
             log(f"[{nickname}] "
                 + (f"纳管 {_swf_n2} 个 SWF 动画/测验/考试/讨论课件（重刷分支）" if ctype == "RESOURCE"
                    else f"跳过 {_swf_n2} 个 SWF 动画课件(重刷分支)"), "INFO")
+        if ctype == "SPOC":
+            leaf_cells = _spoc_filter_reject(leaf_cells, nickname, "重刷分支")
         # 跳过已完成的图片课件(重刷会导致进度回退)
         # SPOC 图片课件 fileType 主值是 'img'（不在 IMAGE_TYPES 集合），同为计数型 totalNum=1
         # 课件，重刷同样回退——仅在本保护点补 'img'，不动全局集合。
@@ -434,16 +565,24 @@ def _brush_progress(client: ZjyClient, nickname: str, class_id: str,
     zyk_resolve_stat = {"ok": 0, "fail": 0}
     mp4_duration_cache = _parse_mp4_durations_parallel(
         client, nickname, leaf_cells, ctype, zyk_url_cache, zyk_resolve_stat,
-        workers=RESOURCE_PARSE_WORKERS if ctype == "RESOURCE" else 4,
+        workers=(RESOURCE_PARSE_WORKERS if ctype == "RESOURCE"
+                 # SPOC 真实时长档：申报值就是解析值 × 系数，解析是**必需**成本，故并发度单独放宽
+                 else SPOC_PARSE_WORKERS if (ctype == "SPOC" and SPOC_V2) else 4),
         # 平台已记满的资源库格下面直接免发，解析结果用不上 —— 不为之花一次 RTT
         skip_speed_full=ctype == "RESOURCE")
 
     # MOOC 跨课件车道:每格整条心跳流派给一条车道串行发送，主循环立刻派发下一格。
     # 只有 MOOC 进入本块；SPOC/RESOURCE 的 lane_ctx 恒 None（红线）
+    # MOOC/SPOC 跨课件车道:每格整条心跳流派给一条车道串行发送，主循环立刻派发下一格。
+    # 两型共用同一套记账结构，但**各自一条池**（互不抢在飞额度）；RESOURCE 恒 None（红线）
     lane_ctx = None
-    if ctype == "MOOC" and MOOC_LANES > 1:
+    _lane_w = (MOOC_LANES if ctype == "MOOC" else SPOC_LANES if ctype == "SPOC" else 1)
+    if ctype in ("MOOC", "SPOC") and _lane_w > 1:
         lane_ctx = {"running": set(), "futs": [], "api": None, "done": 0, "beats": 0, "zero": 0,
-                    "sent": 0, "t0": time.time(), "t_note": 0.0}
+                    "sent": 0, "t0": time.time(), "t_note": 0.0,
+                    "pool": _LANE_POOL if ctype == "MOOC" else _SPOC_LANE_POOL,
+                    "gap": MOOC_LANE_DISPATCH_GAP if ctype == "MOOC" else SPOC_LANE_DISPATCH_GAP,
+                    "items": []}
 
         def _lane_reap():
             """收割已完成车道，按节流打一条"还在跑"的进度行。
@@ -477,7 +616,7 @@ def _brush_progress(client: ZjyClient, nickname: str, class_id: str,
                     f"在飞 {len(lane_ctx['running'])} 车道、均速 {_rate:.0f} 条/秒"
                     f"，已用 {_el:.0f} 秒", "INFO")
 
-        log(f"[{nickname}] 跨课件并行已启用：车道={MOOC_LANES}（每课件内部严格串行），"
+        log(f"[{nickname}] 跨课件并行已启用：车道={_lane_w}（每课件内部严格串行），"
             f"每格派发即报一行，另每 25 秒报一次总进度", "INFO")
 
     success_count = 0
@@ -523,7 +662,7 @@ def _brush_progress(client: ZjyClient, nickname: str, class_id: str,
             lane_ctx["sent"] += 1
             log(f"[{nickname}] 刷进度 ✅ [{idx+1}/{len(leaf_cells)}] {cell_name}", "INFO")
             _lane_reap()
-            time.sleep(MOOC_LANE_DISPATCH_GAP)
+            time.sleep(lane_ctx["gap"])
             continue
 
         if status in ("ok", "noop"):
@@ -544,9 +683,9 @@ def _brush_progress(client: ZjyClient, nickname: str, class_id: str,
 
         # 节点间冷却：MOOC 逐课件串行时原 0.02s 过密（80 节点连续上万条心跳会撞平台限流），
         # 实测 1.5s 可全程不撞；改车道并发后在飞量由车道数封顶，派发间隔压到 0.2s。
-        # SPOC/RESOURCE 间隔维持原值不变。
+        # RESOURCE 间隔维持原值不变（红线）。
         if lane_ctx is not None:
-            time.sleep(MOOC_LANE_DISPATCH_GAP)
+            time.sleep(lane_ctx["gap"])
         elif ctype == "MOOC":
             time.sleep(1.5)
         else:
@@ -603,6 +742,64 @@ def _brush_progress(client: ZjyClient, nickname: str, class_id: str,
                     log(f"[{nickname}] ⚠️ 复核后仍未学完：{str(_cl.get('name'))[:20]}", "WARNING")
                 if len(_still) > 20:
                     log(f"[{nickname}] ⚠️ 另有 {len(_still) - 20} 个未学完（明细略）", "WARNING")
+
+        # ---- SPOC 平台复核补满（真实时长档配套，仅 SPOC 车道）----
+        # 为什么必须有：实测"发完立刻读回"时长入账率只有 0.54（平台落库滞后），而旧形态
+        # 收尾从不读回 ⇒ "心跳全 200 但时长没满"在执行侧完全看不见，用户只能自己发现。
+        if ctype == "SPOC" and lane_ctx["items"]:
+            _items = lane_ctx["items"]          # [(格号, cellId, 申报总长, 课件名), ...]
+
+            def _rd_one(_it):
+                try:
+                    return _spoc_cell_study(client, class_id, _it[1])
+                except Exception:
+                    return (0.0, 0.0)
+
+            _rd_n = 0
+            _last_sig = None
+            while _rd_n < SPOC_RECHECK_ROUNDS:
+                if SPOC_RECHECK_WAIT > 0:
+                    time.sleep(SPOC_RECHECK_WAIT)      # 给平台留出库时间，否则读到的是旧值
+                with ThreadPoolExecutor(max_workers=8) as _ex:
+                    _rdv = list(_ex.map(_rd_one, _items))
+                _short = [(_it, _st, _sp) for _it, (_st, _sp) in zip(_items, _rdv)
+                          if _it[2] > 1 and (_st < _it[2] - 0.5 or _sp < 100)]
+                if not _short:
+                    break
+                # 护栏：读回值与上一轮**完全一致** ⇒ 平台已不再推进，停手别把同样条数白发几轮
+                _sig = tuple(round(_st + _sp, 1) for _st, _sp in _rdv)
+                if _sig == _last_sig:
+                    log(f"[{nickname}] SPOC 复核：第 {_rd_n + 1} 轮读回与上一轮完全一致"
+                        f"（平台未推进），停止补发", "WARNING")
+                    break
+                _last_sig = _sig
+                _rd_n += 1
+                _gap = sum(max(0.0, _it[2] - _st) for _it, _st, _sp in _short)
+                log(f"[{nickname}] SPOC 复核第 {_rd_n} 轮：{len(_short)} 个课件时长/完成度未满"
+                    f"（缺口约 {_gap:.0f} 秒），从已记秒数续推补发...", "WARNING")
+                _tf = []
+                for _it, _st, _sp in _short:
+                    _recs = _spoc_beat_payloads(client, aes_key, class_id, course_info_id,
+                                                _it[1], client.stu_id, _it[2], SPOC_BEAT_STEP,
+                                                False, 0, start=_st)
+                    _b = [x for x in (_spoc_encrypt(client, aes_key, r) for r in _recs) if x]
+                    if _b:
+                        _tf.append(_SPOC_LANE_POOL.submit(_spoc_lane_stream, client, _b))
+                if _tf:
+                    wait(_tf)
+            with ThreadPoolExecutor(max_workers=8) as _ex:
+                _fin = list(_ex.map(_rd_one, _items))
+            _t_ok = sum(1 for _it, (_st, _sp) in zip(_items, _fin)
+                        if _it[2] <= 1 or _st >= _it[2] - 0.5)
+            _s_ok = sum(1 for _it, (_st, _sp) in zip(_items, _fin) if _sp >= 100)
+            _acc = sum(_st for _it, (_st, _sp) in zip(_items, _fin) if _it[2] > 1)
+            log(f"[{nickname}] SPOC 平台复核：时长满 {_t_ok}/{len(_items)}、"
+                f"完成度满 {_s_ok}/{len(_items)}，本轮到账合计 {_acc:.0f} 秒"
+                f"（={_acc/60:.1f} 分，含补发 {_rd_n} 轮）", "INFO")
+            for _it, (_st, _sp) in list(zip(_items, _fin))[:5]:
+                if _it[2] > 1 and (_st < _it[2] - 0.5 or _sp < 100):
+                    log(f"[{nickname}] ⚠️ 复核后仍未满：{str(_it[3])[:20]} "
+                        f"时长 {_st:.0f}/{_it[2]:.0f} 秒 speed={_sp:.0f}", "WARNING")
 
     log(f"[{nickname}] 🎉 进度秒刷结束:成功 {success_count} 个,失败 {fail_count} 个", "INFO")
 
@@ -744,6 +941,13 @@ def _calculate_total_time(client: ZjyClient, nickname: str, cell: dict, idx: int
     """
     if ctype == "MOOC":
         return _mooc_target_seconds(cell, mp4_cache.get(idx), (cell.get("fileType") or "").lower())
+
+    # SPOC 真实时长档：申报总长 = 解析长度（或文档定值）× 系数，条数 = 申报总长/5。
+    # 放在函数最前面是有意的：下面那串"旧记录时长 → 逐格 GET 知识点详情 → studyRecord/list
+    # → random(600,1800)"的阶梯里，**没有一项是课件的真实长度**（平台侧压根不给），
+    # 继续走下去只会白烧一次每格 RTT 再虚增时长。知识点讲解格同样按定值申报（不再逐格 GET）。
+    if ctype == "SPOC" and SPOC_V2:
+        return _spoc_target_seconds(_spoc_kind_of(cell_type), mp4_cache.get(idx))
 
     total_time = None
     spoc_record_time = None
@@ -889,7 +1093,9 @@ def _submit_heartbeat(client: ZjyClient, nickname: str, cell: dict, idx: int, to
                                           {"ok": 0, "noop": 0, "skipped": 0, "disabled": False})
     else:
         ok = _submit_spoc_heartbeat(client, nickname, cell, class_id, course_info_id,
-                                    course_id, cell_type, total_time, aes_key)
+                                    course_id, cell_type, total_time, aes_key, lane_ctx)
+        if ok == "dispatched":
+            return "dispatched"
         return "ok" if ok else "fail"
 
 
@@ -1211,14 +1417,44 @@ def _submit_resource_heartbeat(client: ZjyClient, nickname: str, cell: dict,
 def _submit_spoc_heartbeat(client: ZjyClient, nickname: str, cell: dict,
                             class_id: str, course_info_id: str, course_id: str,
                             cell_type: str, total_time: int,
-                            aes_key: Optional[str]) -> bool:
-    """SPOC 心跳提交:AES-128-ECB 加密,服务器每次+5秒。"""
+                            aes_key: Optional[str], lane_ctx: Optional[dict] = None):
+    """SPOC 心跳提交:AES-128-ECB 加密,服务器每次+5秒。
+
+    lane_ctx 非空 = SPOC 真实时长档已启用 ⇒ 走**跨课件车道**：本格整条心跳流一次加密好，
+    交给一条车道严格串行发完，主循环立刻派发下一格，返回 "dispatched" 由收尾统一结算
+    （真值在"车道回收 + 平台复核"里逐格判，与 MOOC 同口径）。
+    lane_ctx 为空或 SPOC_V2=False ⇒ 逐字退回旧的"格内 10 路并发"形态。
+    """
     if not aes_key:
         log(f"[{nickname}] SPOC 刷课失败: AES 密钥为空(token缺失)", "ERROR")
         return False
 
     cell_id = cell.get("id")
     is_image = cell_type in IMAGE_TYPES
+
+    if lane_ctx is not None and SPOC_V2:
+        _kind = _spoc_kind_of(cell_type)
+        _recs = _spoc_beat_payloads(client, aes_key, class_id, course_info_id, cell_id,
+                                    client.stu_id, total_time, SPOC_BEAT_STEP,
+                                    _kind == "img", SPOC_IMG_BEATS)
+        _bodies = [b for b in (_spoc_encrypt(client, aes_key, r) for r in _recs) if b]
+        if not _bodies:
+            return False
+        # 在飞车道数闸门：满了就等最早的让位，最多干等 60 秒后强行派发（防卡死）
+        _spin = 0
+        while len(lane_ctx["running"]) >= SPOC_LANES:
+            _dn, _ = wait(lane_ctx["running"], timeout=2.0, return_when=FIRST_COMPLETED)
+            lane_ctx["running"] -= _dn
+            _spin += 1
+            if _spin > 30 and not _dn:
+                break
+        _f = lane_ctx["pool"].submit(_spoc_lane_stream, client, _bodies)
+        lane_ctx["futs"].append((cell.get("name", "?"), _f))
+        lane_ctx["running"].add(_f)
+        # 复核对账用：(格号, cellId, 申报总长, 课件名)。图片格申报 1 秒，复核按 <=1 豁免
+        lane_ctx["items"].append((len(lane_ctx["items"]), cell_id, float(total_time),
+                                  cell.get("name", "?")))
+        return "dispatched"
 
     if is_image:
         hb_count = 5
