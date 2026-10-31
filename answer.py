@@ -501,15 +501,25 @@ def _do_spoc_mooc_answer(client: ZjyClient, nickname: str, exam_id: str,
     if bank_count > 0:
         log(f"[{nickname}] 📚 题库兜底补充 {bank_count} 题", "DEBUG")
 
+    # 3.5 MOOC 键面标准答案(typeId=7 匹配题逗号串 / typeId=11 综合题逐子题记录)
+    #     卷内没有这两型时这里零外呼、两张表都空,后续行为与改动前完全一致。
+    matching_answers: dict = {}
+    composite_records: dict = {}
+    if ctype == "MOOC":
+        matching_answers, composite_records = mooc_prepare_key_answers(client, exam_id, questions)
+
     # 4. 检查最终答案覆盖率
     final_has_answer = sum(1 for q in questions if q.get("answer") or q.get("rawAnswer") or q.get("correctAnswer"))
-    log(f"[{nickname}] 📊 {title}: 最终有答案 {final_has_answer}/{len(questions)} 题", "INFO")
+    # 综合题父行的 answer 恒空(答案在子行),按"真备出记录"的父行数补进可答题数;
+    # 一条都没备出的父行不计入 ⇒ 纯综合题卷仍走原"无答案"分支,不会被交成白卷。
+    answerable = final_has_answer + len(composite_records)
+    log(f"[{nickname}] 📊 {title}: 最终有答案 {answerable}/{len(questions)} 题", "INFO")
 
-    if final_has_answer == 0:
+    if answerable == 0:
         return False, "所有题目均无答案,无法提交"
 
     # 5. 计算答题时长(对齐商业版)
-    valid_count = final_has_answer
+    valid_count = answerable
     base_time = valid_count * random.randint(15, 40)
     exam_time = max(base_time, random.randint(30, 120))
     # MOOC: 考试最少1200秒(20分钟),测验最少300秒(5分钟),作业最少60秒,上限1800秒
@@ -539,7 +549,9 @@ def _do_spoc_mooc_answer(client: ZjyClient, nickname: str, exam_id: str,
         ok, result = _submit_mooc_exam(client, nickname, exam_id, class_id,
                                         course_info_id, course_id, category_id,
                                         task_id, questions, exam_time, title,
-                                        gate_wait=gate_wait)
+                                        gate_wait=gate_wait,
+                                        matching_answers=matching_answers,
+                                        composite_records=composite_records)
     else:
         result = _submit_spoc_exam(client, nickname, exam_id, class_id,
                                    course_info_id, course_id, category_id,
@@ -548,12 +560,199 @@ def _do_spoc_mooc_answer(client: ZjyClient, nickname: str, exam_id: str,
 
     if ok:
         msg = (result or {}).get("msg", "提交成功")
-        log(f"[{nickname}] ✅ {title}: {msg} (有答案 {final_has_answer}/{len(questions)} 题)", "SUCCESS")
+        log(f"[{nickname}] ✅ {title}: {msg} (有答案 {answerable}/{len(questions)} 题)", "SUCCESS")
         return True, msg
 
     err_msg = (result or {}).get("msg", "提交失败") if result else "提交请求失败"
     log(f"[{nickname}] ❌ {title}: {err_msg}", "WARNING")
     return False, err_msg
+
+
+# ==================== MOOC 键面标准答案:typeId=7 匹配题 / typeId=11 综合题 ====================
+#
+# 这两型题的标准答案都**不在卷面的 answer 字段**里,只遍历父行必然出错:
+#   - typeId=7 匹配题:卷面 `answer` 装的是**候选词池** `[{SortOrder, optionAnswerContent}]`。把池子当答案发,
+#     平台按池条目数逐个往自己的空位上落,末尾越界 ⇒ HTTP 500「Index: k, Size: k」;
+#     取池下标时也必须发**逗号串**,发 JSON 数组会被平台解析成「A-NaN」判 0 分。
+#   - typeId=11 综合题:父行 `answer` 恒空,答案只挂在各**子行** ⇒ 只遍历父行时整卷被判"无答案"而拒交
+#     (纯综合题卷),或把父行发成空记录(混合卷里该题 0 分且不报错)。
+#
+# 答案面是 `course/exam/getByExamId` 的 `data.paperList`,学生票即可读、平台不校验课程归属;
+# 这一面的父行 id 与子行 id 跟 `course/exam/paper` 面**逐位相同**,所以提交体的 `paperId`/`paperSubId`
+# 直接取这一面即可,不必跨面 join(`record/getInfo` 面的子行 id 是 None,拿不到 paperSubId)。
+#
+# 形态依据:官方 uni-app H5 答题组件 `submitData` 逐字节切片后执行出来的行为——综合题**父行一条不发**,
+# 逐子题各发一条 `{questionNo:"[父序,子序]", paperId, paperSubId, answer}`;已在真机交卷判定为满分。
+#
+# 外呼纪律:**卷内确实有 7 或 11 才多取这一趟**,不含这两型的卷子取数与提交体一字不变。
+
+def _mooc_sort_order(opt):
+    """键面 dataJson 的排序键:SortOrder 可能是 str/int,缺失的排最后(不抛异常)。"""
+    try:
+        return (0, int(str(opt.get("SortOrder"))))
+    except Exception:
+        return (1, 0)
+
+
+def _mooc_key_face_rows(client: ZjyClient, exam_id: str) -> list:
+    """取键面题目行(含 `questionSubList`)。异常/结构不正一律返回空列表,由调用方退回改动前行为。"""
+    try:
+        kb = client.api_get_ai("course/exam/getByExamId", {"id": exam_id, "groupId": "0"}) or {}
+        rows = (kb.get("data") or {}).get("paperList") or []
+    except Exception as e:
+        log(f"[MOOC键面] 取数异常: {e}", "DEBUG")
+        return []
+    return rows if isinstance(rows, list) else []
+
+
+def _mooc_matching_answers(rows: list, question_ids: set) -> dict:
+    """typeId=7:键面 `dataJson[*].optionSelectContent`(每空的候选池下标,0 基)→ 逗号串。
+
+    :return: `{questionId: "1,2,3,0"}`。形不正(缺字段/非整数/空数组)的题跳过,调用方据此发空串——
+             **绝不回退发候选词池**,那是 500 的源头。
+    """
+    out = {}
+    for r in rows:
+        if not isinstance(r, dict) or str(r.get("typeId") or "") != "7":
+            continue
+        qid = str(r.get("questionId") or "")
+        if not qid or qid not in question_ids:
+            continue
+        try:
+            arr = json.loads(r.get("dataJson") or "[]")
+        except Exception:
+            continue
+        if not isinstance(arr, list) or not arr:
+            continue
+        if any(not isinstance(a, dict) or a.get("optionSelectContent") in (None, "") for a in arr):
+            continue
+        sel = []
+        for a in sorted(arr, key=_mooc_sort_order):
+            s = str(a.get("optionSelectContent")).strip()
+            if not s.isdigit():
+                sel = []
+                break
+            sel.append(s)
+        if sel:
+            out[qid] = ",".join(sel)
+    return out
+
+
+def _mooc_composite_map(rows: list, question_ids: set) -> dict:
+    """typeId=11:取每个父行的子行标准答案与 id。
+
+    :return: `{父questionId: {"paper_id": 父行id, "subs": [{sub_id, type_id, answer, data_json}]}}`
+             (按子行原序;父行 id 缺失或子行全空答案的父行不返回)
+    """
+    out = {}
+    for r in rows:
+        if not isinstance(r, dict) or str(r.get("typeId") or "") != "11":
+            continue
+        qid = str(r.get("questionId") or "")
+        if not qid or qid not in question_ids:
+            continue
+        subs = r.get("questionSubList")
+        if not isinstance(subs, list) or not subs:
+            continue
+        parsed = []
+        for sb in subs:
+            if not isinstance(sb, dict):
+                continue
+            raw = sb.get("answer")
+            parsed.append({"sub_id": str(sb.get("id") or ""),
+                           "type_id": str(sb.get("typeId") or ""),
+                           "answer": str(raw if raw is not None else "").strip(),
+                           "data_json": sb.get("dataJson")})
+        if parsed and any(p["answer"] for p in parsed):
+            out[qid] = {"paper_id": str(r.get("id") or ""), "subs": parsed}
+    return out
+
+
+def _mooc_composite_records(parent_no: int, parent_paper_id: str, subs: list) -> list:
+    """把一个综合题父行按官方形态翻成若干条提交记录(纯函数,便于离线核对)。
+
+    子题再按自己的题型归一:
+      - 1 单选 / 2 多选:原样数字串(多选为逗号串),并带 `optionSort`＝本子题选项数组;
+      - 3 判断 / 6 问答:原样文本;
+      - **4 / 5 填空:发 JSON 文本数组,且数组长度＝该子题的空数**。键面 `dataJson` 里
+        `IsAnswer:true` 的 `Content` 一条一个空,天然就是空数;把 `"值1,值2"` 整串塞进一个元素
+        只得部分分(实测 80.0 → 按空拆数组后 100.0)。
+
+    单条不合格(缺子行 id、无答案、未知题型)只跳过那一条;整父行一条都发不出时返回空列表,
+    调用方据此退回改动前行为——绝不发"看着像答案的东西"。
+    """
+    recs = []
+    if not parent_paper_id or not isinstance(subs, list):
+        return recs
+    for j, sb in enumerate(subs):
+        if not isinstance(sb, dict):
+            continue
+        t = str(sb.get("type_id") or "")
+        raw = str(sb.get("answer") or "").strip()
+        sub_id = str(sb.get("sub_id") or "")
+        if not sub_id or not raw:
+            continue
+        try:
+            dj = json.loads(sb.get("data_json") or "[]")
+        except Exception:
+            dj = []
+        if not isinstance(dj, list):
+            dj = []
+        ans = None
+        option_sort = None
+        if t in ("1", "2", "3", "6"):
+            ans = raw
+            if t in ("1", "2") and dj:
+                option_sort = json.dumps(dj, ensure_ascii=False, separators=(",", ":"))
+        elif t in ("4", "5"):
+            texts = [str(x.get("Content") or "").strip() for x in
+                     sorted(dj, key=_mooc_sort_order)
+                     if isinstance(x, dict) and str(x.get("IsAnswer")).lower() == "true"]
+            texts = [x for x in texts if x != ""]
+            if not texts:
+                texts = [x.strip() for x in raw.split(",") if x.strip() != ""] or [raw]
+            ans = json.dumps(texts, ensure_ascii=False, separators=(",", ":"))
+        if not ans:
+            continue
+        rec = {"questionNo": json.dumps([parent_no, j], separators=(",", ":")),
+               "paperId": parent_paper_id, "paperSubId": sub_id, "answer": ans}
+        if option_sort:
+            rec["optionSort"] = option_sort
+        recs.append(rec)
+    return recs
+
+
+def mooc_prepare_key_answers(client: ZjyClient, exam_id: str, questions: list):
+    """卷内确有 typeId=7/11 时取一趟键面,返回 `(匹配题答案表, {父行下标: 子题记录列表})`。
+
+    综合题记录在这里就备好:调用方的"全卷无答案"判定要靠它才看得见子题答案,
+    而**只有真备出记录的父行**才计入——否则会把"原先拒交"变成"交一份白卷",那是更糟的退化。
+    """
+    q7 = {str(q.get("questionId") or "") for q in questions
+          if isinstance(q, dict) and _get_type_id(q) == "7" and q.get("questionId")}
+    q11 = {str(q.get("questionId") or "") for q in questions
+           if isinstance(q, dict) and _get_type_id(q) == "11" and q.get("questionId")}
+    if not q7 and not q11:
+        return {}, {}
+    rows = _mooc_key_face_rows(client, exam_id)
+    matching = _mooc_matching_answers(rows, q7) if q7 else {}
+    comp = {}
+    if q11:
+        cmap = _mooc_composite_map(rows, q11)
+        for i, q in enumerate(questions):
+            if not isinstance(q, dict) or _get_type_id(q) != "11":
+                continue
+            c = cmap.get(str(q.get("questionId") or ""))
+            if not c:
+                continue
+            pid = str(c.get("paper_id") or q.get("paperId") or q.get("id") or "")
+            recs = _mooc_composite_records(i, pid, c.get("subs"))
+            if recs:
+                comp[i] = recs
+    if matching or comp:
+        log(f"[MOOC键面] 匹配题命中 {len(matching)}/{len(q7)} 题,综合题展开覆盖 {len(comp)}/{len(q11)} 个父行",
+            "DEBUG")
+    return matching, comp
 
 
 # ==================== MOOC 提交 ====================
@@ -562,7 +761,9 @@ def _submit_mooc_exam(client: ZjyClient, nickname: str, exam_id: str,
                       class_id: str, course_info_id: str, course_id: str,
                       category_id: str, task_id: str, questions: list,
                       exam_time: int, title: str = "",
-                      gate_wait: bool = False) -> Tuple[bool, Optional[dict]]:
+                      gate_wait: bool = False,
+                      matching_answers: Optional[dict] = None,
+                      composite_records: Optional[dict] = None) -> Tuple[bool, Optional[dict]]:
     """MOOC 提交:updateExamTime 累加时长 → (gate_wait 真实等满闸门) → POST course/exam/record。
 
     对齐生产版(2026-09-14/16):
@@ -575,12 +776,21 @@ def _submit_mooc_exam(client: ZjyClient, nickname: str, exam_id: str,
     # 1. updateExamTime 累加作答时长(查已累加值只补差值、熔断、重新认证)
     _mooc_update_exam_time(client, exam_id, course_info_id, course_id, exam_time, task_id, nickname)
 
-    # 2. 构建 taskExamProblemRecordList(仅 questionNo/paperId/answer,无 optionSort)
+    # 2. 构建 taskExamProblemRecordList
+    #    普通题:{questionNo:父行下标, paperId, answer}(7/11 的取数与形态见 mooc_prepare_key_answers)
     records = []
     for i, q in enumerate(questions):
         type_id = _get_type_id(q)
+        # 综合题:父行一条不发,逐子题各发一条 {questionNo:"[父,子]", paperId, paperSubId, answer}
+        if type_id == "11" and composite_records and composite_records.get(i):
+            records.extend(composite_records[i])
+            continue
         paper_id = str(q.get("paperId") or q.get("id") or q.get("questionId") or "")
         answer = _convert_answer_for_submit(q, type_id)
+        if type_id == "7":
+            # 匹配题只认键面取到的候选池下标逗号串;取不到就发空串(该题 0 分),
+            # 绝不把卷面 answer 里的候选词池发出去——那会让平台 500「Index: k, Size: k」。
+            answer = (matching_answers or {}).get(str(q.get("questionId") or ""), "")
         # 从 dataJson 的 IsAnswer 提取答案(答案为空时)
         if not answer:
             dj = q.get("dataJson")
